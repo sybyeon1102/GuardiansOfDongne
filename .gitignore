@@ -1,0 +1,21 @@
+.env
+
+# datasets
+*.pt
+*.npy
+*.pkl
+*.mp4
+*.xml
+
+# venv
+.venv/
+
+# Python 캐시
+__pycache__/
+.pytest_cache/
+
+# trash
+trash/
+
+# vscode
+.vscode

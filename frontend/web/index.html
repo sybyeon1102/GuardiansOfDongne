@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>RTSP + LSTM (Video | Stats)</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:#111; font-family:system-ui, sans-serif; color:#eee; }
+    .grid { display:grid; grid-template-columns: 1fr 320px; gap:12px; height:100vh; padding:12px; }
+    .panel, .video { border:1px solid #333; border-radius:10px; background:#181818; }
+    .video { display:flex; align-items:center; justify-content:center; overflow:hidden; }
+    .video img { max-width:100%; max-height:100%; display:block; }
+    .panel { padding:12px; overflow:auto; }
+    .title { font-weight:600; margin-bottom:8px; }
+    .bar { margin:8px 0; }
+    .bar .label { font-size:12px; margin-bottom:4px; opacity:.8; display:flex; justify-content:space-between; }
+    .bar .track { width:100%; height:16px; background:#2a2a2a; border-radius:8px; overflow:hidden; }
+    .bar .fill { height:100%; width:0%; background:#3fa7ff; transition:width .2s ease; }
+    .row { display:flex; gap:8px; align-items:center; }
+    .chip { font-size:12px; padding:4px 8px; border:1px solid #333; border-radius:999px; background:#202020; }
+    .ok { color:#9cff9c; }
+    .warn { color:#ffb86c; }
+  </style>
+</head>
+<body>
+  <div class="grid">
+    <div class="video">
+      <img src="/stream" alt="stream"/>
+    </div>
+    <div class="panel">
+      <div class="title">Model Probabilities</div>
+      <div id="bars"></div>
+      <hr style="border:none;border-top:1px solid #333;margin:12px 0;">
+      <div class="title">Status</div>
+      <div class="row">
+        <div id="status" class="chip">loading...</div>
+        <div id="ts" class="chip">--</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const barsEl = document.getElementById('bars');
+    const statusEl = document.getElementById('status');
+    const tsEl = document.getElementById('ts');
+    let labels = [];
+
+    async function fetchProbs(){
+      try{
+        const r = await fetch('/probs', {cache:'no-store'});
+        const j = await r.json();
+        if(!labels.length && Array.isArray(j.events)){ labels = j.events; buildBars(labels); }
+        if(j.ok && j.probs){
+          updateBars(j.probs);
+          statusEl.textContent = 'OK';
+          statusEl.className = 'chip ok';
+        }else{
+          statusEl.textContent = 'WARMING';
+          statusEl.className = 'chip warn';
+        }
+        tsEl.textContent = new Date().toLocaleTimeString();
+      }catch(e){
+        statusEl.textContent = 'ERROR';
+        statusEl.className = 'chip';
+      }
+    }
+
+    function buildBars(labels){
+      barsEl.innerHTML = '';
+      labels.forEach((lb,i)=>{
+        const wrap = document.createElement('div'); wrap.className = 'bar';
+        const lab  = document.createElement('div'); lab.className = 'label';
+        lab.innerHTML = `<span>${lb}</span><span id="ptext-${i}">0.00</span>`;
+        const track = document.createElement('div'); track.className = 'track';
+        const fill  = document.createElement('div'); fill.className = 'fill'; fill.id = `pfill-${i}`;
+        track.appendChild(fill);
+        wrap.appendChild(lab); wrap.appendChild(track);
+        barsEl.appendChild(wrap);
+      });
+    }
+
+    function updateBars(probs){
+      probs.forEach((p,i)=>{
+        const pct = Math.max(0, Math.min(1, Number(p))) * 100;
+        const f = document.getElementById(`pfill-${i}`);
+        const t = document.getElementById(`ptext-${i}`);
+        if(f){ f.style.width = pct.toFixed(1)+'%'; }
+        if(t){ t.textContent = Number(p).toFixed(2); }
+      });
+    }
+
+    // 300ms마다 폴링(간단/안정)
+    setInterval(fetchProbs, 300);
+    fetchProbs();
+  </script>
+</body>
+</html>
