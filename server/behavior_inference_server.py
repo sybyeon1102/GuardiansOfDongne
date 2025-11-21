@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -22,6 +22,8 @@ from sqlmodel import Field, Session, SQLModel, create_engine
 
 CKPT_PATH = os.getenv("CKPT_PATH", "lstm_multilabel_05.pt")
 META_PATH = os.getenv("META_PATH")  # 없으면 ckpt 안의 meta 사용
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 예: postgresql+psycopg2://user:password@localhost:5432/dbname
 DATABASE_URL = os.getenv(
@@ -44,11 +46,15 @@ KAKAO_ENABLED = bool(KAKAO_ACCESS_TOKEN)
 engine = create_engine(DATABASE_URL, echo=False)
 
 
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class InferenceResult(SQLModel, table=True):
     __tablename__ = "inference_results"
 
     id: int | None = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utcnow, nullable=False)
 
     camera_id: str
     source_id: str | None = None
@@ -71,7 +77,7 @@ class KakaoAlarmLog(SQLModel, table=True):
     __tablename__ = "kakao_alarm_log"
 
     id: int | None = Field(default=None, primary_key=True)
-    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    created_at: datetime = Field(default_factory=utcnow, nullable=False)
 
     camera_id: str
     source_id: str | None = None
@@ -220,7 +226,7 @@ _norm_std: np.ndarray | None = None
 def load_model_and_meta() -> None:
     global _model, _events, _norm_mean, _norm_std
 
-    ck = torch.load(CKPT_PATH, map_location="cpu")
+    ck = torch.load(CKPT_PATH, map_location=DEVICE)
     meta: dict[str, Any] = ck.get("meta", {})
 
     if not meta and META_PATH and os.path.exists(META_PATH):
@@ -244,6 +250,7 @@ def load_model_and_meta() -> None:
 
     model = LSTMAnom(feat_dim=feat_dim, num_out=num_out)
     model.load_state_dict(ck["model"])
+    model.to(DEVICE)
     model.eval()
 
     _model = model
@@ -275,7 +282,7 @@ def run_inference_from_keypoints_sequence(kpt_seq: np.ndarray) -> tuple[
     feat = features_from_buf(list(kpt_seq))  # (T,169)
 
     feat = np.clip((feat - _norm_mean) / (_norm_std + 1e-6), -6, 6)
-    x = torch.from_numpy(feat).unsqueeze(0).float()  # (1,T,F)
+    x = torch.from_numpy(feat).unsqueeze(0).float().to(DEVICE)  # (1,T,F)
 
     with torch.no_grad():
         logits = _model(x)  # type: ignore[arg-type]

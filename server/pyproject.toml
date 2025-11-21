@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.121.3",
     "numpy>=2.3.5",
+    "psycopg2-binary>=2.9.11",
     "requests>=2.32.5",
     "sqlmodel>=0.0.27",
     "torch>=2.9.1",
