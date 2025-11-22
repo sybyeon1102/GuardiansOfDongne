@@ -1,46 +1,67 @@
-from collections.abc import Generator
-from contextlib import asynccontextmanager
-import json
 import os
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import json
+from pathlib import Path
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from collections import deque
+from collections.abc import Generator
 from typing import Any
+from datetime import datetime, timezone
 
 import numpy as np
-import requests
 import torch
 import torch.nn as nn
+import requests
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine
 
-
 # =========================================================
-# 환경 변수 / 설정
+# .env 설정
 # =========================================================
 
-CKPT_PATH = os.getenv("CKPT_PATH", "lstm_multilabel_05.pt")
-META_PATH = os.getenv("META_PATH")  # 없으면 ckpt 안의 meta 사용
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL 환경 변수가 설정되어 있지 않습니다.")
 
-# 예: postgresql+psycopg2://user:password@localhost:5432/dbname
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg2://god_user:secret@localhost:5432/god",
-)
+# 두 개의 PT 경로 (필수)
+DET_CKPT_PATH_RAW = os.getenv("DET_CKPT_PATH")
+CLS_CKPT_PATH_RAW = os.getenv("CLS_CKPT_PATH")
+if not DET_CKPT_PATH_RAW or not CLS_CKPT_PATH_RAW:
+    raise RuntimeError("DET_CKPT_PATH, CLS_CKPT_PATH 둘 다 .env 에 설정되어야 합니다.")
 
-# 1차 정상/이상 threshold (pt 하나에서 파생)
-ANOMALY_THRESHOLD = float(os.getenv("ANOMALY_THRESHOLD", "0.5"))
+DET_CKPT_PATH = str(Path(DET_CKPT_PATH_RAW).expanduser())
+CLS_CKPT_PATH = str(Path(CLS_CKPT_PATH_RAW).expanduser())
+
+# meta.json 경로 (선택)
+DET_META_PATH = os.getenv("DET_META_PATH")  # 없으면 ckpt["meta"] 사용
+CLS_META_PATH = os.getenv("CLS_META_PATH")  # 없으면 ckpt["meta"] 사용
+
+# 이상 탐지용 voting / threshold 파라미터
+EMA_ALPHA = float(os.getenv("EMA_ALPHA", "0.3"))
+DET_START_THR = float(os.getenv("DET_START_THR", "0.80"))
+DET_END_THR = float(os.getenv("DET_END_THR", "0.55"))
+DET_VOTE_WIN = int(os.getenv("DET_VOTE_WIN", "5"))
+DET_MIN_START_VOTES = int(os.getenv("DET_MIN_START_VOTES", "4"))
+DET_MIN_END_VOTES = int(os.getenv("DET_MIN_END_VOTES", "4"))
+DET_MIN_EVENT_SEC = float(os.getenv("DET_MIN_EVENT_SEC", "2.0"))
+DET_COOLDOWN_SEC = float(os.getenv("DET_COOLDOWN_SEC", "3.0"))
 
 # Kakao
 KAKAO_ACCESS_TOKEN = (os.getenv("KAKAO_ACCESS_TOKEN") or "").strip()
 KAKAO_ENABLED = bool(KAKAO_ACCESS_TOKEN)
 
+# torch 디바이스
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[DEVICE] using {DEVICE}")
 
 # =========================================================
-# SQLModel ORM 정의
+# DB / SQLModel
 # =========================================================
 
 engine = create_engine(DATABASE_URL, echo=False)
@@ -66,7 +87,6 @@ class InferenceResult(SQLModel, table=True):
     stage1_normal: float
     stage1_anomaly: float
 
-    # JSON 문자열로 저장 (labels, probs)
     stage2_labels_json: str
     stage2_probs_json: str
     stage2_top_label: str | None = None
@@ -95,7 +115,7 @@ class KakaoAlarmLog(SQLModel, table=True):
     kakao_status_code: int | None = None
     kakao_error: str | None = None
 
-    kakao_raw_response_json: str | None = None  # 카카오 응답 JSON 문자열
+    kakao_raw_response_json: str | None = None
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -104,7 +124,7 @@ def get_session() -> Generator[Session, None, None]:
 
 
 # =========================================================
-# LSTM 모델 / 전처리 (레거시 기반)
+# LSTM 모델 / feature 전처리
 # =========================================================
 
 class AttPool(nn.Module):
@@ -178,7 +198,9 @@ def features_from_buf(buf: list[np.ndarray]) -> np.ndarray:
         n2[n2==0] = 1e-6
         cos=(v1*v2).sum(-1)/(n1*n2)
         return np.arccos(np.clip(cos,-1,1))
-    def pick(i): return xy_n[:,i,:]
+
+    def pick(i):
+        return xy_n[:,i,:]
     angs = np.stack([
         ang(pick(11),pick(13),pick(15)),
         ang(pick(12),pick(14),pick(16)),
@@ -187,9 +209,9 @@ def features_from_buf(buf: list[np.ndarray]) -> np.ndarray:
     ],axis=1)                                  # (T,4)
 
     feat = np.concatenate([xy_n.reshape(T,-1),   # 66
-                         vel.reshape(T,-1),    # 66
-                         angs,                 # 4
-                         vis.reshape(T,-1)],1) # 33
+        vel.reshape(T,-1),    # 66
+        angs,                 # 4
+        vis.reshape(T,-1)],1) # 33
     feat = feat.astype(np.float32)               # (T,169)
     return np.clip(feat,-10,10)
 
@@ -201,7 +223,7 @@ def _ffill_bfill(arr):
     has = np.zeros(D,bool)
     for t in range(T):
         nz = ~np.isnan(out[t])
-        last[nz]=out[t,nz]
+        last[nz] = out[t,nz]
         has |= nz
         miss = np.isnan(out[t])&has
         out[t,miss] = last[miss]
@@ -210,183 +232,189 @@ def _ffill_bfill(arr):
     for t in range(T-1,-1,-1):
         nz = ~np.isnan(out[t])
         last[nz] = out[t,nz]
-        has |=nz
+        has |= nz
         miss = np.isnan(out[t])&has
         out[t,miss] = last[miss]
     return np.nan_to_num(out,nan=0.0,posinf=0.0,neginf=0.0)
 
 
-# --- 전역 상태 ---
-_model: LSTMAnom | None = None
-_events: list[str] = []
-_norm_mean: np.ndarray | None = None
-_norm_std: np.ndarray | None = None
+@dataclass
+class LSTMBundle:
+    model: LSTMAnom
+    norm_mean: np.ndarray
+    norm_std: np.ndarray
+    events: list[str] | None = None  # 분류 모델만 사용
 
 
-def load_model_and_meta() -> None:
-    global _model, _events, _norm_mean, _norm_std
-
-    ck = torch.load(CKPT_PATH, map_location=DEVICE)
-    meta: dict[str, Any] = ck.get("meta", {})
-
-    if not meta and META_PATH and os.path.exists(META_PATH):
-        with open(META_PATH, encoding="utf-8") as f:
-            meta = json.load(f)
-
-    events = meta.get("events")
-    feat_dim: int | None = ck.get("feat_dim")
-    num_out: int | None = ck.get("num_out", len(events) if events else None)
-
-    assert events is not None, "meta['events'] 가 없습니다."
-    assert feat_dim is not None, "ckpt['feat_dim'] 이 없습니다."
-    assert num_out == len(events), "num_out 과 events 길이가 맞지 않습니다."
-
-    norm_mean = np.asarray(meta.get("norm_mean", 0.0), np.float32)
-    norm_std = np.asarray(meta.get("norm_std", 1.0), np.float32)
-    if norm_mean.ndim == 0:
-        norm_mean = np.full([feat_dim], float(norm_mean), np.float32)
-    if norm_std.ndim == 0:
-        norm_std = np.full([feat_dim], float(norm_std), np.float32)
-
-    model = LSTMAnom(feat_dim=feat_dim, num_out=num_out)
-    model.load_state_dict(ck["model"])
-    model.to(DEVICE)
-    model.eval()
-
-    _model = model
-    _events = list(events)
-    _norm_mean = norm_mean
-    _norm_std = norm_std
-
-    print(f"[MODEL] loaded ckpt={CKPT_PATH}, events={_events}")
+_det_bundle: LSTMBundle | None = None
+_cls_bundle: LSTMBundle | None = None
 
 
-def run_inference_from_keypoints_sequence(kpt_seq: np.ndarray) -> tuple[
-    list[str],
-    np.ndarray,
-    float,
-    float,
-]:
+def _load_meta_from_ckpt_or_json(
+    ck: dict[str, Any],
+    meta_path: str | None,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    if "meta" in ck and isinstance(ck["meta"], dict):
+        meta = dict(ck["meta"])
+    if meta_path:
+        p = Path(meta_path)
+        if p.is_file():
+            with p.open(encoding="utf-8") as f:
+                meta = json.load(f)
+    return meta
+
+
+def load_models_and_meta() -> None:
+    global _det_bundle, _cls_bundle
+
+    # --- 이상 탐지 모델 ---
+    ck_det = torch.load(DET_CKPT_PATH, map_location=DEVICE)
+    meta_det = _load_meta_from_ckpt_or_json(ck_det, DET_META_PATH)
+
+    feat_dim_det = meta_det.get("feat_dim") or ck_det.get("feat_dim")
+    if feat_dim_det is None:
+        raise RuntimeError("검출 모델 feat_dim 정보를 찾을 수 없습니다.")
+    feat_dim_det = int(feat_dim_det)
+
+    num_out_det = meta_det.get("num_out") or ck_det.get("num_out") or 1
+    num_out_det = int(num_out_det)
+
+    norm_mean_det = np.asarray(meta_det.get("norm_mean", 0.0), np.float32)
+    norm_std_det = np.asarray(meta_det.get("norm_std", 1.0), np.float32)
+    if norm_mean_det.ndim == 0:
+        norm_mean_det = np.full([feat_dim_det], float(norm_mean_det), np.float32)
+    if norm_std_det.ndim == 0:
+        norm_std_det = np.full([feat_dim_det], float(norm_std_det), np.float32)
+
+    det_model = LSTMAnom(feat_dim=feat_dim_det, num_out=num_out_det)
+    det_model.load_state_dict(ck_det["model"])
+    det_model.to(DEVICE)
+    det_model.eval()
+
+    _det_bundle = LSTMBundle(
+        model=det_model,
+        norm_mean=norm_mean_det,
+        norm_std=norm_std_det,
+        events=None,
+    )
+
+    # --- 이상 분류 모델 ---
+    ck_cls = torch.load(CLS_CKPT_PATH, map_location=DEVICE)
+    meta_cls = _load_meta_from_ckpt_or_json(ck_cls, CLS_META_PATH)
+
+    feat_dim_cls = meta_cls.get("feat_dim") or ck_cls.get("feat_dim")
+    if feat_dim_cls is None:
+        raise RuntimeError("분류 모델 feat_dim 정보를 찾을 수 없습니다.")
+    feat_dim_cls = int(feat_dim_cls)
+
+    num_out_cls = meta_cls.get("num_out") or ck_cls.get("num_out")
+    events_cls = meta_cls.get("events")
+    if events_cls is None:
+        raise RuntimeError("분류 모델 meta['events'] 가 필요합니다.")
+    if num_out_cls is None:
+        num_out_cls = len(events_cls)
+    num_out_cls = int(num_out_cls)
+    if num_out_cls != len(events_cls):
+        raise RuntimeError("분류 모델 num_out 과 events 길이가 일치하지 않습니다.")
+
+    norm_mean_cls = np.asarray(meta_cls.get("norm_mean", 0.0), np.float32)
+    norm_std_cls = np.asarray(meta_cls.get("norm_std", 1.0), np.float32)
+    if norm_mean_cls.ndim == 0:
+        norm_mean_cls = np.full([feat_dim_cls], float(norm_mean_cls), np.float32)
+    if norm_std_cls.ndim == 0:
+        norm_std_cls = np.full([feat_dim_cls], float(norm_std_cls), np.float32)
+
+    cls_model = LSTMAnom(feat_dim=feat_dim_cls, num_out=num_out_cls)
+    cls_model.load_state_dict(ck_cls["model"])
+    cls_model.to(DEVICE)
+    cls_model.eval()
+
+    _cls_bundle = LSTMBundle(
+        model=cls_model,
+        norm_mean=norm_mean_cls,
+        norm_std=norm_std_cls,
+        events=list(events_cls),
+    )
+
+    print(f"[MODEL] det ckpt={DET_CKPT_PATH}, feat_dim={feat_dim_det}, out={num_out_det}")
+    print(
+        f"[MODEL] cls ckpt={CLS_CKPT_PATH}, feat_dim={feat_dim_cls}, "
+        f"out={num_out_cls}, events={events_cls}"
+    )
+
+
+def run_detection_from_keypoints(kpt_seq: np.ndarray) -> float:
     """
-    kpt_seq: (T, 33, 4) float32
-
-    반환:
-      events: 레이블 리스트
-      probs:  (C,) 각 레이블별 확률
-      normal_score, anomaly_score: 1차용 점수 (max_prob 기반)
+    이상 탐지 모델: p_anom (0~1) 반환.
     """
-    if _model is None or not _events or _norm_mean is None or _norm_std is None:
-        raise RuntimeError("모델/메타가 로드되지 않았습니다. load_model_and_meta() 먼저 호출 필요.")
+    if _det_bundle is None:
+        raise RuntimeError("검출 모델이 로드되지 않았습니다.")
 
-    # (T,33,4) 버퍼 → (T,169) feature
-    feat = features_from_buf(list(kpt_seq))  # (T,169)
-
-    feat = np.clip((feat - _norm_mean) / (_norm_std + 1e-6), -6, 6)
-    x = torch.from_numpy(feat).unsqueeze(0).float().to(DEVICE)  # (1,T,F)
-
+    feat = features_from_buf(list(kpt_seq))  # (T,F)
+    feat = np.clip(
+        (feat - _det_bundle.norm_mean) / (_det_bundle.norm_std + 1e-6),
+        -6,
+        6,
+    )
+    x = torch.from_numpy(feat).unsqueeze(0).float().to(DEVICE)
     with torch.no_grad():
-        logits = _model(x)  # type: ignore[arg-type]
-        probs = torch.sigmoid(logits).cpu().numpy()[0]  # (C,)
+        logits = _det_bundle.model(x)
+        probs = torch.sigmoid(logits).detach().cpu().numpy()[0]
 
-    max_prob = float(probs.max()) if probs.size > 0 else 0.0
-    anomaly_score = max_prob
-    normal_score = 1.0 - anomaly_score
+    # num_out>1 이어도 "이상 확률"은 첫 채널로 본다고 가정
+    p_anom = float(probs[0])
+    return p_anom
 
-    return _events, probs, normal_score, anomaly_score
+
+def run_classification_from_keypoints(
+    kpt_seq: np.ndarray,
+) -> tuple[list[str], np.ndarray]:
+    """
+    이상 분류 모델: softmax probs (합=1).
+    """
+    if _cls_bundle is None or _cls_bundle.events is None:
+        raise RuntimeError("분류 모델이 로드되지 않았습니다.")
+
+    feat = features_from_buf(list(kpt_seq))
+    feat = np.clip(
+        (feat - _cls_bundle.norm_mean) / (_cls_bundle.norm_std + 1e-6),
+        -6,
+        6,
+    )
+    x = torch.from_numpy(feat).unsqueeze(0).float().to(DEVICE)
+    with torch.no_grad():
+        logits = _cls_bundle.model(x)
+        probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()[0]
+
+    return _cls_bundle.events, probs
 
 
 # =========================================================
-# 카메라별 anomaly 상태 관리 (START/END 추적)
+# 카메라별 상태 (EMA + voting + START/END)
 # =========================================================
 
 @dataclass
 class CameraState:
     in_anomaly: bool = False
-    current_label: str | None = None
     start_window_index: int | None = None
     start_ts: float | None = None
+    last_end_ts: float = -1e9
+
+    ema_det: float | None = None                # 이상 탐지 EMA
+    ema_cls: np.ndarray | None = None           # 분류 softmax EMA
+    votes: deque[bool | None] = field(
+        default_factory=lambda: deque(maxlen=DET_VOTE_WIN)
+    )
+
+    current_label: str | None = None
 
 
 _camera_states: dict[str, CameraState] = {}
 
 
-def handle_anomaly_transition(
-    session: Session,
-    *,
-    camera_id: str,
-    source_id: str | None,
-    window_index: int,
-    window_start_ts: float | None,
-    window_end_ts: float | None,
-    is_anomaly: bool,
-    top_label: str | None,
-    top_prob: float,
-) -> None:
-    """
-    카메라별로 이전 상태를 보고 START/END 이벤트를 판정하고,
-    END 시점에 Kakao 알람 + KakaoAlarmLog에 기록.
-    """
-    state = _camera_states.get(camera_id, CameraState())
-
-    end_ts = window_end_ts if window_end_ts is not None else window_start_ts
-    now_ts = end_ts if end_ts is not None else float(window_index)
-
-    if not state.in_anomaly and is_anomaly:
-        # START
-        state.in_anomaly = True
-        state.current_label = top_label
-        state.start_window_index = window_index
-        state.start_ts = window_start_ts if window_start_ts is not None else now_ts
-
-    elif state.in_anomaly and not is_anomaly:
-        # END
-        duration = None
-        if state.start_ts is not None and now_ts is not None:
-            duration = max(0.0, float(now_ts - state.start_ts))
-
-        label = state.current_label or top_label or "unknown"
-        text = build_kakao_text(
-            camera_id=camera_id,
-            source_id=source_id,
-            event_label=label,
-            duration_sec=duration,
-            top_prob=top_prob,
-        )
-        kakao_res = send_kakao_alarm(text)
-
-        raw_resp = kakao_res.get("response")
-        raw_json = json.dumps(raw_resp, ensure_ascii=False) if isinstance(raw_resp, dict) else None
-
-        log = KakaoAlarmLog(
-            camera_id=camera_id,
-            source_id=source_id,
-            event_label=label,
-            start_window_index=state.start_window_index,
-            end_window_index=window_index,
-            duration_sec=duration,
-            top_prob=top_prob,
-            text_preview=text,
-            kakao_mode=str(kakao_res.get("mode", "disabled")),
-            kakao_ok=bool(kakao_res.get("ok", False)),
-            kakao_status_code=kakao_res.get("status_code"),
-            kakao_error=kakao_res.get("error"),
-            kakao_raw_response_json=raw_json,
-        )
-        session.add(log)
-        session.commit()
-
-        state = CameraState()
-
-    elif state.in_anomaly and is_anomaly:
-        # 계속 이상 상태 유지.
-        # 라벨이 바뀌면 이전 END + 새 START로 쪼개고 싶다면 여기서 처리 가능.
-        pass
-
-    _camera_states[camera_id] = state
-
-
 # =========================================================
-# Kakao 알림 유틸
+# Kakao 유틸
 # =========================================================
 
 def build_kakao_text(
@@ -401,7 +429,6 @@ def build_kakao_text(
     dur_str = f"{duration_sec:.1f}s" if duration_sec is not None else "unknown"
     prob_pct = int(top_prob * 100)
     ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     return (
         "[이상행동 감지]\n"
         f"- 카메라: {camera_id}\n"
@@ -414,10 +441,6 @@ def build_kakao_text(
 
 
 def send_kakao_alarm(text: str) -> dict[str, Any]:
-    """
-    .env에 KAKAO_ACCESS_TOKEN 이 없으면 아무 것도 보내지 않고 disabled 모드로 동작.
-    있으면 카카오톡 "나에게" 텍스트 보내기 API를 사용.
-    """
     if not KAKAO_ENABLED:
         print("[KAKAO] disabled (no access token)")
         return {"ok": False, "mode": "disabled", "reason": "no_token"}
@@ -459,9 +482,27 @@ def send_kakao_alarm(text: str) -> dict[str, Any]:
 
 
 # =========================================================
-# FastAPI 스키마 / 엔드포인트
+# FastAPI 앱 / lifespan
 # =========================================================
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    SQLModel.metadata.create_all(engine)
+    load_models_and_meta()
+    print("[STARTUP] behavior inference server ready.")
+    yield
+    # 필요하면 종료 처리
+
+
+app = FastAPI(
+    title="Behavior Inference Server (2-model, voting, SQLModel, Kakao)",
+    lifespan=lifespan,
+)
+
+
+# =========================================================
+# 요청/응답 스키마
+# =========================================================
 
 class PoseWindowRequest(BaseModel):
     camera_id: str
@@ -469,8 +510,7 @@ class PoseWindowRequest(BaseModel):
     window_index: int
     window_start_ts: float | None = None
     window_end_ts: float | None = None
-
-    # (T,33,4) : [[ [x,y,z,vis], ...33 ], ...T ]
+    # (T,33,4): [[ [x,y,z,vis], ...33 ], ...T ]
     keypoints: list[list[list[float]]]
 
 
@@ -482,59 +522,54 @@ class BehaviorResultResponse(BaseModel):
     window_end_ts: float | None = None
 
     is_anomaly: bool
+    det_prob: float            # 현재 EMA 기준 이상 확률
     top_label: str | None
     top_prob: float
-    prob: dict[str, float]
+    prob: dict[str, float]     # 이상 분류 (EMA 기준 softmax)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup
-    SQLModel.metadata.create_all(engine)
-    load_model_and_meta()
-    print("[STARTUP] behavior inference server ready.")
-
-    yield
-
-    # shutdown 시 필요하면 여기서 정리
-    # 예: 엔진 디스포즈, 리소스 정리 등
-    # engine.dispose()
-    # print("[SHUTDOWN] behavior inference server stopped.")
-
-
-app = FastAPI(
-    title="Behavior Inference Server (single-pt, SQLModel, Kakao)",
-    lifespan=lifespan,
-)
-
+# =========================================================
+# 메인 엔드포인트
+# =========================================================
 
 @app.post("/behavior/analyze_pose", response_model=BehaviorResultResponse)
 def analyze_pose(
     payload: PoseWindowRequest,
     session: Session = Depends(get_session),
 ):
-    """
-    에이전트가 보낸 포즈 시퀀스(T,33,4)에 대해
-    - LSTM pt로 추론
-    - inference_results 테이블에 저장
-    - START/END 기반 Kakao 알람 + 로그 처리
-    - UI가 사용할 JSON 응답 반환
-    """
     kpt_seq = np.asarray(payload.keypoints, dtype=np.float32)
     if kpt_seq.ndim != 3 or kpt_seq.shape[1:] != (33, 4):
         return JSONResponse(
             status_code=400,
-            content={
-                "detail": f"keypoints shape must be (T,33,4), got {kpt_seq.shape}"
-            },
+            content={"detail": f"keypoints shape must be (T,33,4), got {kpt_seq.shape}"},
         )
 
+    camera_id = payload.camera_id
+    source_id = payload.source_id
+    window_index = payload.window_index
+    ts = payload.window_end_ts or payload.window_start_ts or float(window_index)
+
+    state = _camera_states.get(camera_id)
+    if state is None:
+        state = CameraState()
+        _camera_states[camera_id] = state
+
     try:
-        labels, probs, normal_score, anomaly_score = run_inference_from_keypoints_sequence(
-            kpt_seq
-        )
+        # 1) 이상 탐지 (Model_1)
+        p_anom = run_detection_from_keypoints(kpt_seq)
+        if state.ema_det is None:
+            state.ema_det = p_anom
+        else:
+            state.ema_det = EMA_ALPHA * p_anom + (1.0 - EMA_ALPHA) * state.ema_det
+
+        # 2) 이상 분류 (Model_2)
+        events, probs_cls = run_classification_from_keypoints(kpt_seq)
+        if state.ema_cls is None:
+            state.ema_cls = probs_cls.copy()
+        else:
+            state.ema_cls = EMA_ALPHA * probs_cls + (1.0 - EMA_ALPHA) * state.ema_cls
+
     except NotImplementedError as e:
-        # features_from_buf 연결 전까지는 여기서 에러가 날 수 있음
         return JSONResponse(status_code=500, content={"detail": str(e)})
     except Exception as e:
         print(f"[ERR] inference failed: {e}")
@@ -543,80 +578,125 @@ def analyze_pose(
             content={"detail": f"inference failed: {e}"},
         )
 
-    if probs.size > 0:
-        max_idx = int(probs.argmax())
-        max_prob = float(probs[max_idx])
-        top_label = labels[max_idx] if 0 <= max_idx < len(labels) else None
-    else:
-        max_prob = 0.0
-        top_label = None
+    ema_det = float(state.ema_det if state.ema_det is not None else p_anom)
+    ema_cls = state.ema_cls if state.ema_cls is not None else probs_cls
 
-    is_anomaly = max_prob >= ANOMALY_THRESHOLD
-    prob_dict: dict[str, float] = {ev: float(p) for ev, p in zip(labels, probs)}
+    top_idx = int(np.argmax(ema_cls))
+    top_label = events[top_idx] if 0 <= top_idx < len(events) else None
+    top_prob = float(ema_cls[top_idx])
 
-    # DB: inference_results 저장
+    # voting 업데이트 (이상 여부만)
+    is_high = ema_det >= DET_START_THR
+    state.votes.append(True if is_high else None)
+
+    # per-window is_anomaly (UI/DB용): 단순 threshold + EMA 기준
+    is_anomaly_now = ema_det >= DET_START_THR
+
+    # DB: inference_results 저장 (매 윈도우)
     row = InferenceResult(
-        camera_id=payload.camera_id,
-        source_id=payload.source_id,
-        window_index=payload.window_index,
+        camera_id=camera_id,
+        source_id=source_id,
+        window_index=window_index,
         window_start_ts=payload.window_start_ts,
         window_end_ts=payload.window_end_ts,
-        is_anomaly=is_anomaly,
-        stage1_normal=float(normal_score),
-        stage1_anomaly=float(anomaly_score),
-        stage2_labels_json=json.dumps(labels, ensure_ascii=False),
-        stage2_probs_json=json.dumps([float(x) for x in probs]),
+        is_anomaly=is_anomaly_now,
+        stage1_normal=float(1.0 - p_anom),
+        stage1_anomaly=float(p_anom),
+        stage2_labels_json=json.dumps(events, ensure_ascii=False),
+        stage2_probs_json=json.dumps([float(x) for x in probs_cls]),
         stage2_top_label=top_label,
-        stage2_top_prob=max_prob,
+        stage2_top_prob=top_prob,
     )
     session.add(row)
     session.commit()
 
-    # Kakao START/END 처리 (END에서만 알람 발송)
-    handle_anomaly_transition(
-        session,
-        camera_id=payload.camera_id,
-        source_id=payload.source_id,
-        window_index=payload.window_index,
-        window_start_ts=payload.window_start_ts,
-        window_end_ts=payload.window_end_ts,
-        is_anomaly=is_anomaly,
-        top_label=top_label,
-        top_prob=max_prob,
-    )
+    # START / END 판정 + Kakao 로그
+    if not state.in_anomaly:
+        gap_ok = (ts - state.last_end_ts) >= DET_COOLDOWN_SEC
+        if gap_ok and (state.votes.count(True) >= DET_MIN_START_VOTES):
+            state.in_anomaly = True
+            state.current_label = top_label
+            state.start_ts = ts
+            state.start_window_index = window_index
+            state.votes.clear()
+    else:
+        end_votes = state.votes.count(None)
+        long_enough = (ts - (state.start_ts or ts)) >= DET_MIN_EVENT_SEC
+        end_ok = (
+            ema_det <= DET_END_THR
+            and end_votes >= DET_MIN_END_VOTES
+            and long_enough
+        )
+        if end_ok:
+            dur = ts - (state.start_ts or ts)
+            label_for_log = state.current_label or top_label or "unknown"
+            text = build_kakao_text(
+                camera_id=camera_id,
+                source_id=source_id,
+                event_label=label_for_log,
+                duration_sec=dur,
+                top_prob=top_prob,
+            )
+            kakao_res = send_kakao_alarm(text)
+            raw_resp = kakao_res.get("response")
+            raw_json = (
+                json.dumps(raw_resp, ensure_ascii=False)
+                if isinstance(raw_resp, dict)
+                else None
+            )
+
+            log_row = KakaoAlarmLog(
+                camera_id=camera_id,
+                source_id=source_id,
+                event_label=label_for_log,
+                start_window_index=state.start_window_index,
+                end_window_index=window_index,
+                duration_sec=dur,
+                top_prob=top_prob,
+                text_preview=text,
+                kakao_mode=str(kakao_res.get("mode", "disabled")),
+                kakao_ok=bool(kakao_res.get("ok", False)),
+                kakao_status_code=kakao_res.get("status_code"),
+                kakao_error=kakao_res.get("error"),
+                kakao_raw_response_json=raw_json,
+            )
+            session.add(log_row)
+            session.commit()
+
+            state.in_anomaly = False
+            state.current_label = None
+            state.start_ts = None
+            state.start_window_index = None
+            state.last_end_ts = ts
+            state.votes.clear()
+
+    prob_dict: dict[str, float] = {ev: float(p) for ev, p in zip(events, ema_cls)}
 
     return BehaviorResultResponse(
-        camera_id=payload.camera_id,
-        source_id=payload.source_id,
-        window_index=payload.window_index,
+        camera_id=camera_id,
+        source_id=source_id,
+        window_index=window_index,
         window_start_ts=payload.window_start_ts,
         window_end_ts=payload.window_end_ts,
-        is_anomaly=is_anomaly,
+        is_anomaly=is_anomaly_now,
+        det_prob=ema_det,
         top_label=top_label,
-        top_prob=max_prob,
+        top_prob=top_prob,
         prob=prob_dict,
     )
 
 
-# ---- kakao_test.py 대체용 엔드포인트 ----
+# =========================================================
+# kakao test
+# =========================================================
 
 @app.get("/kakao/test")
 def kakao_test() -> dict[str, Any]:
-    """
-    Kakao 토큰 상태를 확인하고, 필요하면 테스트 메시지를 보낸다.
-
-    - 토큰이 없으면: {"enabled": False, ...}
-    - 토큰이 있으면: 실제로 "테스트 메시지"를 보내고 응답 요약을 반환
-    """
     if not KAKAO_ENABLED:
-        return {
-            "enabled": False,
-            "message": "KAKAO_ACCESS_TOKEN not set",
-        }
+        return {"enabled": False, "message": "KAKAO_ACCESS_TOKEN not set"}
 
     text = "[테스트] 이상행동 알림 시스템 카카오 연동 테스트 메시지입니다."
     res = send_kakao_alarm(text)
-
     return {
         "enabled": True,
         "send_ok": bool(res.get("ok", False)),

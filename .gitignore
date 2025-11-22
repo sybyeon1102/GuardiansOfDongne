@@ -19,3 +19,6 @@ trash/
 
 # vscode
 .vscode
+
+# node
+node_modules/
