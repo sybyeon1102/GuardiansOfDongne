@@ -1,0 +1,77 @@
+
+$python b_train_lstm_01.py --data_dir Model_1 --epochs 30 --batch 64 --lr 5e-4 --save lstm_model1.pt
+
+normal           pos=126046 rate=0.538649
+anomaly          pos=107958 rate=0.461351
+[device] cuda
+[pos_weight] [1.1679999828338623]
+[001] train_loss=0.0776 P=0.9749 R=0.9907 F1=0.9827  valid_loss=0.0414 P=0.9717 R=0.9957 F1=0.9836
+[thr] 0.823
+  ↳ saved: lstm_model1.pt
+[002] train_loss=0.0215 P=0.9943 R=0.9969 F1=0.9956  valid_loss=0.0191 P=0.9915 R=0.9954 F1=0.9935
+[thr] 0.671
+  ↳ saved: lstm_model1.pt
+[003] train_loss=0.0149 P=0.9962 R=0.9980 F1=0.9971  valid_loss=0.0555 P=0.9639 R=0.9977 F1=0.9805
+[thr] 0.922
+[004] train_loss=0.0110 P=0.9972 R=0.9985 F1=0.9978  valid_loss=0.0215 P=0.9877 R=0.9972 F1=0.9924
+[thr] 0.931
+[005] train_loss=0.0085 P=0.9979 R=0.9987 F1=0.9983  valid_loss=0.0145 P=0.9913 R=0.9987 F1=0.9950
+[thr] 0.911
+  ↳ saved: lstm_model1.pt
+[006] train_loss=0.0078 P=0.9980 R=0.9989 F1=0.9985  valid_loss=0.0110 P=0.9932 R=0.9982 F1=0.9957
+[thr] 0.83
+  ↳ saved: lstm_model1.pt
+[007] train_loss=0.0061 P=0.9985 R=0.9991 F1=0.9988  valid_loss=0.0118 P=0.9946 R=0.9970 F1=0.9958
+[thr] 0.625
+[008] train_loss=0.0058 P=0.9986 R=0.9992 F1=0.9989  valid_loss=0.0057 P=0.9970 R=0.9992 F1=0.9981
+[thr] 0.824
+  ↳ saved: lstm_model1.pt
+[009] train_loss=0.0046 P=0.9989 R=0.9993 F1=0.9991  valid_loss=0.0081 P=0.9985 R=0.9965 F1=0.9975
+[thr] 0.325
+[010] train_loss=0.0049 P=0.9989 R=0.9993 F1=0.9991  valid_loss=0.0037 P=0.9981 R=0.9991 F1=0.9986
+[thr] 0.651
+  ↳ saved: lstm_model1.pt
+[011] train_loss=0.0043 P=0.9989 R=0.9993 F1=0.9991  valid_loss=0.0038 P=0.9979 R=0.9994 F1=0.9987
+[thr] 0.645
+[012] train_loss=0.0041 P=0.9991 R=0.9994 F1=0.9992  valid_loss=0.0074 P=0.9956 R=0.9982 F1=0.9969
+[thr] 0.896
+[013] train_loss=0.0039 P=0.9990 R=0.9994 F1=0.9992  valid_loss=0.0029 P=0.9993 R=0.9988 F1=0.9991
+[thr] 0.446
+  ↳ saved: lstm_model1.pt
+[014] train_loss=0.0034 P=0.9992 R=0.9995 F1=0.9993  valid_loss=0.0030 P=0.9977 R=0.9997 F1=0.9987
+[thr] 0.839
+[015] train_loss=0.0030 P=0.9993 R=0.9996 F1=0.9995  valid_loss=0.0053 P=0.9966 R=0.9994 F1=0.9980
+[thr] 0.951
+[016] train_loss=0.0034 P=0.9992 R=0.9994 F1=0.9993  valid_loss=0.0081 P=0.9993 R=0.9956 F1=0.9975
+[thr] 0.161
+[017] train_loss=0.0031 P=0.9993 R=0.9995 F1=0.9994  valid_loss=0.0054 P=0.9969 R=0.9993 F1=0.9981
+[thr] 0.84
+[018] train_loss=0.0029 P=0.9993 R=0.9995 F1=0.9994  valid_loss=0.0089 P=0.9950 R=0.9992 F1=0.9971
+[thr] 0.864
+[019] train_loss=0.0030 P=0.9994 R=0.9996 F1=0.9995  valid_loss=0.0073 P=0.9956 R=0.9995 F1=0.9975
+[thr] 0.946
+[020] train_loss=0.0027 P=0.9994 R=0.9996 F1=0.9995  valid_loss=0.0041 P=0.9979 R=0.9996 F1=0.9987
+[thr] 0.665
+[021] train_loss=0.0025 P=0.9994 R=0.9996 F1=0.9995  valid_loss=0.0038 P=0.9978 R=0.9994 F1=0.9986
+[thr] 0.889
+[022] train_loss=0.0030 P=0.9994 R=0.9995 F1=0.9995  valid_loss=0.0028 P=0.9986 R=0.9995 F1=0.9990
+[thr] 0.779
+  ↳ saved: lstm_model1.pt
+[023] train_loss=0.0024 P=0.9995 R=0.9996 F1=0.9995  valid_loss=0.0068 P=0.9956 R=0.9995 F1=0.9976
+[thr] 0.937
+[024] train_loss=0.0026 P=0.9994 R=0.9996 F1=0.9995  valid_loss=0.0031 P=0.9993 R=0.9987 F1=0.9990
+[thr] 0.358
+[025] train_loss=0.0024 P=0.9994 R=0.9997 F1=0.9995  valid_loss=0.0120 P=0.9944 R=0.9968 F1=0.9956
+[thr] 0.437
+[026] train_loss=0.0024 P=0.9995 R=0.9996 F1=0.9995  valid_loss=0.0041 P=0.9973 R=0.9999 F1=0.9986
+[thr] 0.866
+[027] train_loss=0.0025 P=0.9994 R=0.9996 F1=0.9995  valid_loss=0.0045 P=0.9970 R=0.9996 F1=0.9983
+[thr] 0.758
+[028] train_loss=0.0018 P=0.9995 R=0.9997 F1=0.9996  valid_loss=0.0090 P=0.9947 R=0.9999 F1=0.9973
+[thr] 0.992
+[029] train_loss=0.0022 P=0.9995 R=0.9997 F1=0.9996  valid_loss=0.0133 P=0.9924 R=0.9998 F1=0.9961
+[thr] 0.979
+[030] train_loss=0.0021 P=0.9995 R=0.9997 F1=0.9996  valid_loss=0.0075 P=0.9969 R=0.9982 F1=0.9976
+[thr] 0.636
+  ↳ saved loss log: lstm_model1_loss.csv
+[TIME] Elapsed time: 1040.02 seconds
