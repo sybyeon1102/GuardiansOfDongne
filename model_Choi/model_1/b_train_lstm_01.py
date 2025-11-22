@@ -1,4 +1,4 @@
-# changer from: b_train_lstm_00.py
+# changed from: b_train_lstm_00.py
 # model_1, Y.npy
 # Train/Val Loss, (Positive = 1 = 이상행동) precision, recall, f1
 
@@ -97,7 +97,7 @@ def run():
     m = LSTMAnom(feat_dim=X.shape[2], num_out=1).to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=args.lr)
 
-    pos_c = np.clip(Y_bin.sum(0), 1.0, None)       # (1,)
+    pos_c = np.clip(Y_bin.sum(0), 1.0, None)
     neg_c = Y_bin.shape[0] - pos_c
     pos_weight = torch.tensor(neg_c / pos_c, dtype=torch.float32).clamp_(1.0, 100.0).to(device)
     print("[pos_weight]", pos_weight.cpu().numpy().round(3).tolist())
@@ -128,20 +128,20 @@ def run():
         tr_true_det = []
         tr_pred_det = []
         
-        for x, y in dl_tr:                 # y: (B, 1)
+        for x, y in dl_tr:
             x, y = x.to(device), y.to(device)
             opt.zero_grad()
-            logit = m(x)                   # (B, 1)
+            logit = m(x)
             loss = bce(logit, y)
             loss.backward()
             opt.step()
             s += float(loss) * x.size(0)
             tot += x.size(0)
 
-            prob = torch.sigmoid(logit).squeeze(1)      # (B,)
+            prob = torch.sigmoid(logit).squeeze(1)
 
-            true_det = y.squeeze(1).int().cpu().numpy()          # (B,)
-            pred_det = (prob > 0.5).int().cpu().numpy()          # (B,)
+            true_det = y.squeeze(1).int().cpu().numpy()
+            pred_det = (prob > 0.5).int().cpu().numpy()
 
             tr_true_det.extend(true_det.tolist())
             tr_pred_det.extend(pred_det.tolist())
@@ -160,9 +160,9 @@ def run():
         va_pred_det = []
 
         with torch.no_grad():
-            for x, y in dl_va:             # y: (B, 1)
+            for x, y in dl_va:
                 x, y = x.to(device), y.to(device)
-                logit = m(x)               # (B, 1)
+                logit = m(x)
                 loss = bce(logit, y)
                 s += float(loss) * x.size(0)
                 tot += x.size(0)
@@ -199,9 +199,9 @@ def run():
         history["valid_recall"].append(va_recall)
         history["valid_f1"].append(va_f1)
 
-        va_logits = np.concatenate(va_logits, 0)   # (N_va, 1)
-        va_true = np.concatenate(va_true, 0)       # (N_va, 1)
-        va_prob = 1 / (1 + np.exp(-va_logits))     # (N_va, 1)
+        va_logits = np.concatenate(va_logits, 0)
+        va_true = np.concatenate(va_true, 0)
+        va_prob = 1 / (1 + np.exp(-va_logits))
 
         # binary threshold (이상행동 확률 기준)
         y_true = va_true[:, 0]
