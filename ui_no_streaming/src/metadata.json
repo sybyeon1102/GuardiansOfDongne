@@ -1,0 +1,23 @@
+{
+  "camera_id": "cam01",
+  "source_id": "video_2025-11-21_01.mp4",
+  "window_index": 123,
+  "window_start_ts": 12.0,
+  "window_end_ts": 13.0,
+
+  "is_anomaly": true,
+
+  "top_label": "fire",
+  "top_prob": 0.9,
+
+  "prob": {
+    "abandon": 0.05,
+    "broken": 0.02,
+    "fall": 0.01,
+    "fight": 0.01,
+    "fire": 0.90,
+    "smoke": 0.01,
+    "theft": 0.00,
+    "weak_pedestrian": 0.00
+  }
+}
