@@ -1,29 +1,11 @@
 import { useEffect, useState } from "react";
-
-type Probabilities = {
-  fall: number;
-  abandon: number;
-  broken: number;
-  fight: number;
-  fire: number;
-  smoke: number;
-  theft: number;
-  weak_pedestrian: number;
-};
+import type { Probabilities, EventLogEntry } from "../App";
 
 type ConnectionStatus = "ok" | "disconnected";
 
-type EventLogEntry = {
-  id: number;
-  timestamp: string;
-  cameraId: string | null;
-  sourceId: string | null;
-  topLabel: string;
-  topProb: number;
-};
-
 type RightPanelProps = {
   warningVideoUrl: string;
+  activeWarningCamera: string | null;
   probabilities: Probabilities;
   connectionStatus: ConnectionStatus;
   topLabel: string | null;
@@ -45,8 +27,12 @@ const probabilityLabels: { key: keyof Probabilities; label: string }[] = [
   { key: "weak_pedestrian", label: "Weak pedestrian" },
 ];
 
+// App에서 쓰는 warning 임계값과 동일하게 맞춤
+const WARNING_THRESHOLD = 0.4;
+
 export function RightPanel({
   warningVideoUrl,
+  activeWarningCamera,
   probabilities,
   connectionStatus,
   topLabel,
@@ -88,16 +74,22 @@ export function RightPanel({
   const displayCameraName =
     warningFeedName ||
     (lastCameraId
-      ? `Camera ${lastCameraId}`
+      ? `Camera ${lastCameraId.replace("cam", "")}`
       : lastSourceId
       ? `${lastSourceId}`
       : "-");
 
-  return (
-    <aside className="w-80 border-l border-gray-200 bg-gray-50 flex flex-col gap-4 p-4">
+  const isWarningActive =
+    activeWarningCamera != null && (topProb ?? 0) >= WARNING_THRESHOLD;
 
-      {/* Warning Video Section (border-4, VideoGrid 스타일과 통일) */}
-      <div className="bg-white rounded-xl overflow-hidden shadow-sm border-4 border-yellow-400">
+  return (
+    <aside className="w-80 border-l border-gray-200 bg-gray-50 flex flex-col gap-4 pt-0 px-4 pb-4">
+      {/* Warning Video Section */}
+      <div
+        className={`bg-white rounded-xl overflow-hidden shadow-sm border-4 ${
+          isWarningActive ? "border-yellow-400" : "border-gray-300"
+        }`}
+      >
         <div className="px-4 py-2 border-b border-yellow-300 bg-yellow-50">
           <div className="flex flex-col text-xs">
             <span className="font-semibold text-yellow-800">Warning</span>
@@ -122,8 +114,14 @@ export function RightPanel({
           Anomaly Classification
         </h2>
 
-        {/* Top Anomaly (테두리 더 굵게 + 패딩 통일감) */}
-        <div className="mb-3 rounded-lg bg-yellow-50 border-4 border-yellow-400 px-4 py-3 text-xs">
+        {/* Top Anomaly */}
+        <div
+          className={`mb-3 rounded-lg px-4 py-3 text-xs border-4 ${
+            (topProb ?? 0) >= WARNING_THRESHOLD
+              ? "border-yellow-400 bg-yellow-50"
+              : "border-gray-300 bg-gray-50"
+          }`}
+        >
           <div className="text-[11px] text-yellow-800 font-semibold mb-2">
             Top Anomaly
           </div>

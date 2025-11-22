@@ -1,4 +1,7 @@
+// src/components/VideoGrid.tsx
+
 import { Calendar } from "lucide-react";
+import { StreamVideo } from "./StreamVideo";
 
 export function VideoGrid({
   videos,
@@ -39,7 +42,7 @@ export function VideoGrid({
               }`}
             >
               <div className="aspect-video w-full bg-black">
-                <video
+                <StreamVideo
                   src={video.videoUrl}
                   className="w-full h-full object-cover"
                   autoPlay

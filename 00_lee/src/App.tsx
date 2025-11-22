@@ -40,17 +40,17 @@ export default function App() {
     {
       id: 0,
       name: "Camera 01",
-      videoUrl: "/videos/Camera_01_fight.mp4",
+      videoUrl: "http://localhost:4000/hls/cam01/index.m3u8", // RTSP-HLS 주소 rstp://{카메라계정ID}:{PW}@{IP주소}/stream1 > HLS 주소 변환 > 프론트 재생
     },
     {
       id: 1,
       name: "Camera 02",
-      videoUrl: "/videos/Camera_02_theaf.mp4",
+      videoUrl: "http://localhost:4000/hls/cam02/index.m3u8",
     },
     {
       id: 2,
       name: "Camera 03",
-      videoUrl: "/videos/Camera_03_smoke.mp4",
+      videoUrl: "http://localhost:4000/hls/cam03/index.m3u8",
     },
   ]);
 
@@ -86,9 +86,9 @@ export default function App() {
 
   const [eventLogs, setEventLogs] = useState<EventLogEntry[]>([]);
 
-  // ----------------------------------------------------------------------------------
-  // ---------- TEST RANDOM PROBABILITIES (현재 테스트용, 나중에 백엔드로 대체 가능)
-  // ----------------------------------------------------------------------------------
+  // ------------------------------------------------------------
+  // 현재는 랜덤 테스트 데이터 (나중에 WebSocket/HTTP로 교체 예정)
+  // ------------------------------------------------------------
   useEffect(() => {
     const interval = setInterval(() => {
       const p: Probabilities = {
@@ -119,94 +119,6 @@ export default function App() {
 
     return () => clearInterval(interval);
   }, []);
-
-
-
-  // ================================================================================
-  // 실제 백엔드 연결 시 여기에서 데이터를 받으면 됨 (WebSocket 또는 HTTP Polling)
-  // ================================================================================
-
-  // --------------------------
-  // ① WebSocket 연결 예시
-  // --------------------------
-  /*
-  useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws");
-
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-
-      // 확률 업데이트
-      setProbabilities(data.prob);
-
-      setTopLabel(data.top_label);
-      setTopProb(data.top_prob);
-
-      // 카메라 / 소스 ID 업데이트
-      setLastCameraId(data.camera_id ?? null);
-      setLastSourceId(data.source_id ?? null);
-
-      // Warning video 표시
-      if (data.is_anomaly) {
-        const idx = videoFeeds.findIndex((v) =>
-          v.name.includes(data.camera_id)
-        );
-        if (idx >= 0) setWarningFeedId(idx);
-      }
-
-      // 이벤트 로그 기록
-      setEventLogs((prev) => {
-        const now = new Date();
-        const ts = now.toLocaleTimeString("ko-KR", { hour12: false });
-
-        const newEntry = {
-          id: prev.length + 1,
-          timestamp: ts,
-          cameraId: data.camera_id,
-          sourceId: data.source_id,
-          topLabel: data.top_label,
-          topProb: data.top_prob,
-        };
-
-        return [newEntry, ...prev].slice(0, 50);
-      });
-    };
-
-    return () => ws.close();
-  }, []);
-  */
-
-
-  // --------------------------
-  // ② HTTP Polling 방식 예시
-  // --------------------------
-  /*
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      const res = await fetch("http://localhost:8000/predict");
-      const data = await res.json();
-
-      setProbabilities(data.prob);
-      setTopLabel(data.top_label);
-      setTopProb(data.top_prob);
-      setLastCameraId(data.camera_id);
-      setLastSourceId(data.source_id);
-
-      if (data.is_anomaly) {
-        const idx = videoFeeds.findIndex((v) =>
-          v.name.includes(data.camera_id)
-        );
-        if (idx >= 0) setWarningFeedId(idx);
-      }
-    }, 500);
-
-    return () => clearInterval(interval);
-  }, []);
-  */
-
-  // ================================================================================
-
-
 
   // ---------- DRAG & DROP ----------
   const handleDragStart = (id: number) => setDraggedFeedId(id);
@@ -241,12 +153,9 @@ export default function App() {
         <Header />
 
         <main className="flex-1 overflow-auto p-4">
-          {/* ⭐ VideoGrid와 RightPanel 상단 위치 일치 */}
           <div className="flex gap-4 h-full items-start">
-
-            {/* LEFT SIDE (2.5 ratio) */}
+            {/* LEFT SIDE */}
             <div className="flex-[2.5] flex flex-col gap-4">
-
               <VideoGrid
                 videos={videoFeeds}
                 mainFeedId={mainFeedId}
@@ -262,6 +171,7 @@ export default function App() {
                 isPlaying={isPlaying}
                 currentTime={currentTime}
                 isWarning={warningFeedId === mainFeedId}
+                isMainSelected={true}
                 onTimeUpdate={setCurrentTime}
                 onDurationChange={setDuration}
                 onDragStart={handleDragStart}
@@ -284,7 +194,7 @@ export default function App() {
               />
             </div>
 
-            {/* RIGHT SIDE (1.2 ratio) */}
+            {/* RIGHT SIDE */}
             <div className="flex-[1.2] flex-shrink-0">
               <RightPanel
                 warningVideoUrl={warningFeed ? warningFeed.videoUrl : ""}
