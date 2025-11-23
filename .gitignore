@@ -6,6 +6,8 @@
 *.pkl
 *.mp4
 *.xml
+*.log
+*.csv
 
 # venv
 .venv/
