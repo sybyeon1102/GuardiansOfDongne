@@ -86,7 +86,11 @@
 FastAPI 앱 엔트리는 `agent/agent_app.py` 의 `app` 이다.
 `agent` 디렉터리에서 다음과 같이 실행한다.
 
-    uv run fastapi dev agent_app.py --host 0.0.0.0 --port 9001
+    uv run fastapi dev agent_app.py --host 0.0.0.0 --port 8001
+
+    혹은
+
+    uv run fastapi run agent_app.py --host 0.0.0.0 --port 8001
 
 에이전트가 기동되면 다음을 수행한다.
 
@@ -117,13 +121,13 @@ HLS 루트는 `/hls` 로 마운트된다. 플레이리스트 위치는 다음과
 
 예시 (`AGENT_CAMERA_IDS=cam01,cam02` 인 경우):
 
-- `http://localhost:9001/hls/cam01/index.m3u8`
-- `http://localhost:9001/hls/cam02/index.m3u8`
+- `http://localhost:8001/hls/cam01/index.m3u8`
+- `http://localhost:8001/hls/cam02/index.m3u8`
 
 React / 웹 UI에서의 사용 예시는 다음과 같다.
 
     <video
-      src="http://localhost:9001/hls/cam01/index.m3u8"
+      src="http://localhost:8001/hls/cam01/index.m3u8"
       controls
     />
 
