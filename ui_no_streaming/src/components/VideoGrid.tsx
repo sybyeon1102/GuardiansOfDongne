@@ -1,12 +1,9 @@
-// src/components/VideoGrid.tsx
-
 import { Calendar } from "lucide-react";
-import { StreamVideo } from "./StreamVideo";
 
 export function VideoGrid({
   videos,
   mainFeedId,
-  warningFeedId,
+  activeWarningCamera,
   onSelectVideo,
   onDragStart,
   onDropOnThumbnail,
@@ -19,7 +16,9 @@ export function VideoGrid({
 
       <div className="grid grid-cols-3 gap-4">
         {videos.map((video) => {
-          const isWarning = video.id === warningFeedId;
+          // "Camera 01" → "cam01" 형태로 변환
+          const cameraId = video.name.replace("Camera ", "cam");
+          const isWarning = cameraId === activeWarningCamera;
           const isMain = video.id === mainFeedId;
 
           return (
@@ -42,7 +41,7 @@ export function VideoGrid({
               }`}
             >
               <div className="aspect-video w-full bg-black">
-                <StreamVideo
+                <video
                   src={video.videoUrl}
                   className="w-full h-full object-cover"
                   autoPlay

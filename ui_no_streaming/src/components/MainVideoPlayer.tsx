@@ -1,7 +1,4 @@
-// src/components/MainVideoPlayer.tsx
-
 import { useEffect, useRef } from "react";
-import { StreamVideo } from "./StreamVideo";
 
 export function MainVideoPlayer({
   feedId,
@@ -17,24 +14,32 @@ export function MainVideoPlayer({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  // 외부 재생/일시정지 제어 및 currentTime 동기화는
-  // 직접 videoRef를 써야 하므로 별도 useEffect 유지
+  // 영상 URL 변경 → 새로 로드
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+
+    v.pause();
+    v.src = videoUrl;
+    v.load();
+    v.currentTime = 0;
+    onTimeUpdate(0);
+
+    if (isPlaying) v.play().catch(() => {});
+  }, [videoUrl]);
 
   // 재생/일시정지
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
-    if (isPlaying) {
-      v.play().catch(() => {});
-    } else {
-      v.pause();
-    }
+    isPlaying ? v.play().catch(() => {}) : v.pause();
   }, [isPlaying]);
 
   // currentTime 동기화
   useEffect(() => {
     const v = videoRef.current;
     if (!v) return;
+
     if (Math.abs(v.currentTime - currentTime) > 0.3) {
       v.currentTime = currentTime;
     }
@@ -53,7 +58,7 @@ export function MainVideoPlayer({
   };
 
   const borderClass = isWarning
-    ? "warning-border"
+    ? "warning-border" // VideoGrid와 동일한 경고 테두리 (깜빡임)
     : isMainSelected
     ? "border-indigo-500"
     : "border-gray-300";
@@ -73,17 +78,13 @@ export function MainVideoPlayer({
         onDragStart={() => onDragStart(feedId)}
       >
         <div className="aspect-[4/3] w-full bg-black">
-          <StreamVideo
-            src={videoUrl}
+          <video
+            ref={videoRef}
             className="w-full h-full object-cover"
-            autoPlay={isPlaying}
-            loop
             muted
+            loop
             onLoadedMetadata={handleMeta}
             onTimeUpdate={handleTimeUpdate}
-            // ref를 직접 전달해야 currentTime 제어가 가능하므로,
-            // StreamVideo 내부에서 videoRef를 forwardRef로 바꾸는 버전이 필요하면
-            // 그때 리팩터링 가능. (지금은 autoPlay 위주로 유지)
           />
         </div>
       </div>

@@ -1,5 +1,3 @@
-// src/App.tsx
-
 import { useState, useEffect } from "react";
 import { Header } from "./components/Header";
 import { Sidebar } from "./components/Sidebar";
@@ -35,28 +33,35 @@ export type EventLogEntry = {
 };
 
 export default function App() {
+  // warning 임계값
+  const WARNING_THRESHOLD = 0.4;
+
   // ---------- CAMERA FEEDS ----------
   const [videoFeeds] = useState<VideoFeed[]>([
     {
       id: 0,
       name: "Camera 01",
-      videoUrl: "http://localhost:4000/hls/cam01/index.m3u8", // RTSP-HLS 주소 rstp://{카메라계정ID}:{PW}@{IP주소}/stream1 > HLS 주소 변환 > 프론트 재생
+      videoUrl: "/videos/Camera_01_fight.mp4",
     },
     {
       id: 1,
       name: "Camera 02",
-      videoUrl: "http://localhost:4000/hls/cam02/index.m3u8",
+      videoUrl: "/videos/Camera_02_theaf.mp4",
     },
     {
       id: 2,
       name: "Camera 03",
-      videoUrl: "http://localhost:4000/hls/cam03/index.m3u8",
+      videoUrl: "/videos/Camera_03_smoke.mp4",
     },
   ]);
 
   const [mainFeedId, setMainFeedId] = useState<number>(0);
-  const [warningFeedId, setWarningFeedId] = useState<number | null>(2);
   const [draggedFeedId, setDraggedFeedId] = useState<number | null>(null);
+
+  // 현재 warning 상태인 camera_id (예: "cam01")
+  const [activeWarningCamera, setActiveWarningCamera] = useState<string | null>(
+    null
+  );
 
   // ---------- VIDEO PLAYER CONTROL ----------
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
@@ -86,9 +91,9 @@ export default function App() {
 
   const [eventLogs, setEventLogs] = useState<EventLogEntry[]>([]);
 
-  // ------------------------------------------------------------
-  // 현재는 랜덤 테스트 데이터 (나중에 WebSocket/HTTP로 교체 예정)
-  // ------------------------------------------------------------
+  // ----------------------------------------------------------------------------------
+  // 테스트용 랜덤 확률 (나중에 백엔드로 대체)
+  // ----------------------------------------------------------------------------------
   useEffect(() => {
     const interval = setInterval(() => {
       const p: Probabilities = {
@@ -112,13 +117,38 @@ export default function App() {
       setTopLabel(maxLabel);
       setTopProb(maxProb);
 
-      if (maxProb > 0.6) {
-        setWarningFeedId(2);
+      // 테스트용 camera_id 고정
+      const fakeCameraId = "cam01";
+      setLastCameraId(fakeCameraId);
+      setLastSourceId("video_2025-11-21_01.mp4");
+
+      // warning 임계치 적용
+      if (maxProb >= WARNING_THRESHOLD) {
+        setActiveWarningCamera(fakeCameraId);
+      } else {
+        setActiveWarningCamera(null);
       }
+
+      // 이벤트 로그 예시 (원하면 활성화)
+      // const now = new Date();
+      // const ts = now.toLocaleTimeString("ko-KR", { hour12: false });
+      // setEventLogs((prev) => {
+      //   const newEntry: EventLogEntry = {
+      //     id: prev.length + 1,
+      //     timestamp: ts,
+      //     cameraId: fakeCameraId,
+      //     sourceId: "video_2025-11-21_01.mp4",
+      //     topLabel: maxLabel,
+      //     topProb: maxProb,
+      //   };
+      //   return [newEntry, ...prev].slice(0, 50);
+      // });
     }, 2000);
 
     return () => clearInterval(interval);
   }, []);
+
+  // ================================================================================
 
   // ---------- DRAG & DROP ----------
   const handleDragStart = (id: number) => setDraggedFeedId(id);
@@ -142,8 +172,17 @@ export default function App() {
   };
 
   const mainFeed = videoFeeds.find((v) => v.id === mainFeedId)!;
+
+  // activeWarningCamera → warningFeed 찾기
   const warningFeed =
-    warningFeedId != null ? videoFeeds.find((v) => v.id === warningFeedId) : null;
+    activeWarningCamera != null
+      ? videoFeeds.find(
+          (v) => v.name.replace("Camera ", "cam") === activeWarningCamera
+        ) ?? null
+      : null;
+
+  // mainFeedId → camera_id 형태로 변환 (cam01, cam02, cam03)
+  const mainCameraId = `cam0${mainFeedId + 1}`;
 
   return (
     <div className="flex h-screen bg-gray-100">
@@ -159,7 +198,7 @@ export default function App() {
               <VideoGrid
                 videos={videoFeeds}
                 mainFeedId={mainFeedId}
-                warningFeedId={warningFeedId}
+                activeWarningCamera={activeWarningCamera}
                 onSelectVideo={setMainFeedId}
                 onDragStart={handleDragStart}
                 onDropOnThumbnail={handleDropOnThumbnail}
@@ -170,7 +209,7 @@ export default function App() {
                 videoUrl={mainFeed.videoUrl}
                 isPlaying={isPlaying}
                 currentTime={currentTime}
-                isWarning={warningFeedId === mainFeedId}
+                isWarning={activeWarningCamera === mainCameraId}
                 isMainSelected={true}
                 onTimeUpdate={setCurrentTime}
                 onDurationChange={setDuration}
@@ -198,6 +237,7 @@ export default function App() {
             <div className="flex-[1.2] flex-shrink-0">
               <RightPanel
                 warningVideoUrl={warningFeed ? warningFeed.videoUrl : ""}
+                activeWarningCamera={activeWarningCamera}
                 probabilities={probabilities}
                 connectionStatus={connectionStatus}
                 topLabel={topLabel}
