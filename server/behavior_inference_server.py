@@ -25,6 +25,32 @@ from sqlmodel import Field, Session, SQLModel, create_engine
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+
+def _resolve_path(raw: str | None, *, required: bool = False) -> str | None:
+    """
+    .env 에서 읽은 경로 문자열을 안전하게 절대 경로로 변환한다.
+
+    - raw 가 None/빈 문자열:
+        * required=True 면 RuntimeError
+        * required=False 면 None 반환
+    - ~ (홈 디렉터리) 확장
+    - 환경변수($HOME 등) 확장
+    - 상대 경로면 BASE_DIR(server 디렉터리) 기준 절대 경로로 변환
+    """
+    if not raw:
+        if required:
+            raise RuntimeError("필수 경로 환경변수가 비어 있습니다.")
+        return None
+
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    p = Path(expanded)
+
+    if not p.is_absolute():
+        p = (BASE_DIR / p).resolve()
+
+    return str(p)
+
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL 환경 변수가 설정되어 있지 않습니다.")
@@ -35,12 +61,15 @@ CLS_CKPT_PATH_RAW = os.getenv("CLS_CKPT_PATH")
 if not DET_CKPT_PATH_RAW or not CLS_CKPT_PATH_RAW:
     raise RuntimeError("DET_CKPT_PATH, CLS_CKPT_PATH 둘 다 .env 에 설정되어야 합니다.")
 
-DET_CKPT_PATH = str(Path(DET_CKPT_PATH_RAW).expanduser())
-CLS_CKPT_PATH = str(Path(CLS_CKPT_PATH_RAW).expanduser())
+DET_CKPT_PATH = _resolve_path(DET_CKPT_PATH_RAW, required=True)
+CLS_CKPT_PATH = _resolve_path(CLS_CKPT_PATH_RAW, required=True)
 
 # meta.json 경로 (선택)
-DET_META_PATH = os.getenv("DET_META_PATH")  # 없으면 ckpt["meta"] 사용
-CLS_META_PATH = os.getenv("CLS_META_PATH")  # 없으면 ckpt["meta"] 사용
+DET_META_PATH_RAW = os.getenv("DET_META_PATH")   # 없으면 ckpt["meta"] 사용
+CLS_META_PATH_RAW = os.getenv("CLS_META_PATH")   # 없으면 ckpt["meta"] 사용
+
+DET_META_PATH = _resolve_path(DET_META_PATH_RAW, required=False)
+CLS_META_PATH = _resolve_path(CLS_META_PATH_RAW, required=False)
 
 # 이상 탐지용 voting / threshold 파라미터
 EMA_ALPHA = float(os.getenv("EMA_ALPHA", "0.3"))
