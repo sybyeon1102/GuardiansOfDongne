@@ -1,11 +1,9 @@
-// src/components/MainVideoPlayer.tsx
-
 import { useEffect, useRef } from "react";
-import { StreamVideo } from "./StreamVideo";
+import Hls from "hls.js";
 
 export function MainVideoPlayer({
   feedId,
-  videoUrl,
+  cameraId,
   isPlaying,
   currentTime,
   isWarning,
@@ -16,40 +14,60 @@ export function MainVideoPlayer({
   onDropOnMain,
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
 
-  // 외부 재생/일시정지 제어 및 currentTime 동기화는
-  // 직접 videoRef를 써야 하므로 별도 useEffect 유지
+  // 프론트에서 받아오는 HLS URL
+  // const hlsUrl = `https://pmhmdhwetxzhngkw.tunnel.elice.io/hls/${cameraId}/index.m3u8`;
+  const hlsUrl = `http://localhost:8001/hls/${cameraId}/index.m3u8`;
 
-  // 재생/일시정지
+  // 카메라 아이디가 바뀔 때마다 새로운 HLS 스트림 로딩
   useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (isPlaying) {
-      v.play().catch(() => {});
-    } else {
-      v.pause();
+    const video = videoRef.current;
+    if (!video) return;
+
+    // 기존 인스턴스 제거
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
     }
+
+    // Hls.js 지원 브라우저
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: true, lowLatencyMode: true });
+      hlsRef.current = hls;
+
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (isPlaying) video.play().catch(() => {});
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        console.warn("[HLS error]", event, data);
+      });
+    } else {
+      // Safari 등의 네이티브 HLS 지원 브라우저
+      video.src = hlsUrl;
+      video.addEventListener("loadedmetadata", () => {
+        if (isPlaying) video.play().catch(() => {});
+      });
+    }
+  }, [cameraId]);
+
+  // 재생/일시정지 제어
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    if (isPlaying) video.play().catch(() => {});
+    else video.pause();
   }, [isPlaying]);
 
-  // currentTime 동기화
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    if (Math.abs(v.currentTime - currentTime) > 0.3) {
-      v.currentTime = currentTime;
-    }
-  }, [currentTime]);
-
-  const handleMeta = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    onDurationChange(v.duration || 0);
-  };
-
   const handleTimeUpdate = () => {
-    const v = videoRef.current;
-    if (!v) return;
-    onTimeUpdate(v.currentTime);
+    const video = videoRef.current;
+    if (!video) return;
+    onTimeUpdate(video.currentTime);
   };
 
   const borderClass = isWarning
@@ -73,17 +91,12 @@ export function MainVideoPlayer({
         onDragStart={() => onDragStart(feedId)}
       >
         <div className="aspect-[4/3] w-full bg-black">
-          <StreamVideo
-            src={videoUrl}
+          <video
+            ref={videoRef}
             className="w-full h-full object-cover"
-            autoPlay={isPlaying}
-            loop
             muted
-            onLoadedMetadata={handleMeta}
             onTimeUpdate={handleTimeUpdate}
-            // ref를 직접 전달해야 currentTime 제어가 가능하므로,
-            // StreamVideo 내부에서 videoRef를 forwardRef로 바꾸는 버전이 필요하면
-            // 그때 리팩터링 가능. (지금은 autoPlay 위주로 유지)
+            playsInline
           />
         </div>
       </div>
