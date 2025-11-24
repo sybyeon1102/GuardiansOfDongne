@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from sqlmodel import Field, Session, SQLModel, create_engine
+from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 # =========================================================
 # .env 설정
@@ -734,3 +734,77 @@ def kakao_test() -> dict[str, Any]:
         "error": res.get("error"),
         "raw_response": res.get("response"),
     }
+
+
+# =========================================================
+# 최근 추론 결과 조회
+# =========================================================
+
+@app.get(
+    "/behavior/latest/{camera_id}",
+    response_model=BehaviorResultResponse | None,
+)
+def get_latest_behavior(
+    camera_id: str,
+    session: Session = Depends(get_session),
+):
+    """
+    주어진 camera_id에 대해 DB에 저장된
+    가장 최신 InferenceResult 한 건을 BehaviorResultResponse 형태로 반환한다.
+    없으면 null을 반환한다.
+    """
+    stmt = (
+        select(InferenceResult)
+        .where(InferenceResult.camera_id == camera_id)
+        .order_by(InferenceResult.created_at.desc())
+        .limit(1)
+    )
+    row = session.exec(stmt).first()
+    if row is None:
+        # FastAPI + response_model=... | None 이므로 null로 응답한다.
+        return None
+
+    # stage2_* 컬럼으로부터 label->prob 딕셔너리 구성
+    try:
+        labels = json.loads(row.stage2_labels_json or "[]")
+    except Exception:
+        labels = []
+
+    try:
+        probs_raw = json.loads(row.stage2_probs_json or "[]")
+        probs_list = [float(p) for p in probs_raw]
+    except Exception:
+        probs_list = []
+
+    prob_dict: dict[str, float] = {
+        label: float(p)
+        for label, p in zip(labels, probs_list)
+    }
+
+    # top_label / top_prob 결정
+    if row.stage2_top_label is not None:
+        top_label = row.stage2_top_label
+        top_prob = float(row.stage2_top_prob or 0.0)
+    elif labels and probs_list:
+        top_idx = int(np.argmax(probs_list))
+        top_label = labels[top_idx]
+        top_prob = float(probs_list[top_idx])
+    else:
+        top_label = None
+        top_prob = 0.0
+
+    # det_prob는 stage1_anomaly를 그대로 쓴다.
+    det_prob = float(row.stage1_anomaly)
+
+    return BehaviorResultResponse(
+        camera_id=row.camera_id,
+        source_id=row.source_id,
+        window_index=row.window_index,
+        window_start_ts=row.window_start_ts,
+        window_end_ts=row.window_end_ts,
+        is_anomaly=row.is_anomaly,
+        det_prob=det_prob,
+        top_label=top_label,
+        top_prob=top_prob,
+        prob=prob_dict,
+    )
