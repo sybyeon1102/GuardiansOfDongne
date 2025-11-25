@@ -22,10 +22,12 @@ from sqlmodel import (
     create_engine,
     select,
 )
+from dotenv import load_dotenv
 
 from modeling.inference.pose_features import features_from_pose_seq
 from modeling.inference.behavior_det import BehaviorDetector, BehaviorDetectorConfig
 from modeling.inference.behavior_cls import BehaviorClassifier, BehaviorClassifierConfig
+
 
 # ---------------------------------------------------------
 # 로깅
@@ -42,6 +44,7 @@ logging.basicConfig(
 # ---------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 
 def _env_str(name: str, default: str | None = None) -> str:
