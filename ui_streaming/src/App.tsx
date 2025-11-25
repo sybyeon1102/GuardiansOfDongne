@@ -83,7 +83,7 @@ export interface TrackingSnapshot {
 
 // -------------------------------------------------------------
 
-const WARNING_THRESHOLD = 0.4;
+const WARNING_THRESHOLD = 0.6;
 
 // -------------------------------------------------------------
 // 환경 변수
@@ -179,7 +179,8 @@ export default function App() {
   // ----------------------------------------------------------------------
 
   useEffect(() => {
-    const url = `${INFERENCE_BASE_URL}/behavior/latest_all?agent_code=${AGENT_CODE}`;
+    // const url = `${INFERENCE_BASE_URL}/behavior/latest_all?agent_code=${AGENT_CODE}`;
+    const url = `${INFERENCE_BASE_URL}/behavior/latest_by_camera?agent_code=${AGENT_CODE}`;
 
     const fetchBehavior = async () => {
       try {
@@ -235,22 +236,30 @@ export default function App() {
   }, []);
 
   // ----------------------------------------------------------------------
-  // (3) Agent(8001) tracking/latest_all 가져오기
+  // (3) 8000 tracking/latest_all 가져오기  ← 수정된 부분
   // ----------------------------------------------------------------------
 
   useEffect(() => {
+    const url = `${INFERENCE_BASE_URL}/tracking/latest_all?agent_code=${AGENT_CODE}`;
+
     const fetchTracking = async () => {
       try {
-        const res = await fetch(`${AGENT_BASE_URL}/tracking/latest_all`);
-        if (!res.ok) return;
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) {
+          console.warn("[Server] tracking fetch failed, status=", res.status);
+          return;
+        }
 
         const data: TrackingSnapshot[] = await res.json();
+
         const byCam: Record<string, TrackingSnapshot> = {};
-        data.forEach((snap) => (byCam[snap.camera_id] = snap));
+        data.forEach((snap) => {
+          byCam[snap.camera_id] = snap;
+        });
 
         setTrackingByCamera(byCam);
-      } catch {
-        console.warn("[Agent] tracking fetch failed");
+      } catch (err) {
+        console.warn("[Server] tracking fetch error", err);
       }
     };
 
@@ -285,6 +294,7 @@ export default function App() {
     if (!mainCameraId) return;
 
     const br = behaviorByCamera[mainCameraId];
+
     if (!br) {
       setProbabilities({
         fall: 0,
@@ -395,45 +405,48 @@ export default function App() {
 
         <main className="flex-1 overflow-auto p-4">
           <div className="flex gap-4 h-full">
-             {/* LEFT: 남은 공간 전체 사용 */}
-          <div className="flex-1 flex flex-col gap-4 min-w-0">
-            <VideoGrid
-              cameras={videoFeeds}
-              mainCameraId={mainCameraId}
-              warningCameraIds={warningCameraIds}
-              onSelectCamera={setMainCameraId}
-              onDragStart={handleDragStart}
-              onDropOnThumbnail={handleDropOnThumbnail}
-              isDataStale={isDataStale}
-            />
 
-            {mainCamera && (
-              <MainVideoPlayer
-                cameraId={mainCamera.cameraId}
-                mjpegUrl={`${AGENT_BASE_URL}/streams/${mainCamera.cameraId}.mjpeg`}
-                tracking={mainTracking}
+            {/* LEFT: 남은 공간 전체 사용 */}
+            <div className="flex-1 flex flex-col gap-4 min-w-0">
+              <VideoGrid
+                cameras={videoFeeds}
+                mainCameraId={mainCameraId}
+                warningCameraIds={warningCameraIds}
+                onSelectCamera={setMainCameraId}
+                onDragStart={handleDragStart}
+                onDropOnThumbnail={handleDropOnThumbnail}
+                isDataStale={isDataStale}
               />
-            )}
-          </div>
 
-          {/* RIGHT: 고정 크기 패널 */}
-          <div className="w-[30vw] flex-shrink-0">
-            <RightPanel
-              selectedCameraName={mainCamera?.name ?? null}
-              selectedCameraId={selectedCameraId}
-              probabilities={probabilities}
-              connectionStatus={connectionStatus}
-              isDataStale={isDataStale}
-              topLabel={topLabel}
-              topProb={topProb}
-              lastCameraId={lastCameraId}
-              lastSourceId={lastSourceId}
-              eventLogs={eventLogs}
-              selectedHasWarning={selectedHasWarning}
-            />
-          </div>
+              {mainCamera && (
+                <MainVideoPlayer
+                  cameraId={mainCamera.cameraId}
+                  mjpegUrl={`${AGENT_BASE_URL}/streams/${mainCamera.cameraId}.mjpeg`}
+                  tracking={mainTracking}
+                />
+              )}
+            </div>
 
-        </div>
+            {/* RIGHT: 고정 크기 패널 */}
+            <div className="w-[30vw] flex-shrink-0">
+              <RightPanel
+                selectedCameraName={mainCamera?.name ?? null}
+                selectedCameraId={selectedCameraId}
+                probabilities={probabilities}
+                connectionStatus={connectionStatus}
+                isDataStale={isDataStale}
+                topLabel={topLabel}
+                topProb={topProb}
+                lastCameraId={lastCameraId}
+                lastSourceId={lastSourceId}
+                eventLogs={eventLogs}
+                selectedHasWarning={selectedHasWarning}
+
+                isAnomaly={behaviorByCamera[mainCameraId]?.is_anomaly ?? false}  // ← 추가
+              />
+            </div>
+
+          </div>
         </main>
       </div>
     </div>
