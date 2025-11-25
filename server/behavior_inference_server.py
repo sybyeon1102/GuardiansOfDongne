@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
+import cv2
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +21,12 @@ from sqlmodel import (
     create_engine,
     select,
 )
-from dotenv import load_dotenv
+from project_core.env import load_env, env_str, env_float, env_int, env_bool, env_path
 
 from modeling.inference.pose_features import features_from_pose_seq
 from modeling.inference.behavior_det import BehaviorDetector, BehaviorDetectorConfig
 from modeling.inference.behavior_cls import BehaviorClassifier, BehaviorClassifierConfig
+from modeling.tracking.engine import MultiCameraTracker, TrackResult
 
 
 # ---------------------------------------------------------
@@ -42,67 +44,13 @@ logging.basicConfig(
 # ---------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
-
-
-def _env_str(name: str, default: str | None = None) -> str:
-    v = os.getenv(name)
-    if v is None:
-        if default is None:
-            raise RuntimeError(f"missing environment variable: {name}")
-        return default
-    return v
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return float(v)
-    except ValueError:
-        logger.warning("ENV %s=%r is not a valid float, using default %s", name, v, default)
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    try:
-        return int(v)
-    except ValueError:
-        logger.warning("ENV %s=%r is not a valid int, using default %s", name, v, default)
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v2 = v.strip().lower()
-    if v2 in ("1", "true", "yes", "on"):
-        return True
-    if v2 in ("0", "false", "no", "off"):
-        return False
-    logger.warning("ENV %s=%r is not a valid bool, using default %s", name, v, default)
-    return default
-
-
-def _resolve_env_path(name: str) -> Path:
-    raw = _env_str(name)
-    expanded = os.path.expanduser(raw)
-    p = Path(expanded)
-    if not p.is_absolute():
-        p = (BASE_DIR / p).resolve()
-    return p
-
+load_env(BASE_DIR)
 
 # ---------------------------------------------------------
 # DB 설정
 # ---------------------------------------------------------
 
-DATABASE_URL = _env_str("DATABASE_URL")
+DATABASE_URL = env_str("DATABASE_URL")
 
 engine = create_engine(DATABASE_URL, echo=False)
 
@@ -121,15 +69,18 @@ class Agent(SQLModel, table=True):
     __tablename__ = "agents"
 
     id: int | None = Field(default=None, primary_key=True)
-    code: str = Field(index=True, unique=True)
-    kakao_access_token: str | None = None
-    note: str | None = None
     created_at: float = Field(default_factory=lambda: time.time())
-    updated_at: float = Field(default_factory=lambda: time.time())
+
+    # 외부에서 사용하는 고유 코드 (예: 에이전트 장치 식별용)
+    code: str = Field(index=True, unique=True)
+
+    # 메타 정보 (예: 설치 위치, 담당자 등)
+    name: str | None = None
+    metadata_json: str | None = None
 
 
-class InferenceResult(SQLModel, table=True):
-    __tablename__ = "inference_results"
+class BehaviorResult(SQLModel, table=True):
+    __tablename__ = "behavior_result"
 
     id: int | None = Field(default=None, primary_key=True)
     created_at: float = Field(default_factory=lambda: time.time())
@@ -162,13 +113,13 @@ class KakaoAlarmLog(SQLModel, table=True):
     camera_id: str = Field(index=True)
     source_id: str | None = None
 
-    event_label: str | None = None
-    start_window_index: int | None = None
-    end_window_index: int | None = None
-    duration_sec: float | None = None
-    top_prob: float | None = None
+    event_label: str
+    start_window_index: int
+    end_window_index: int
+    duration_sec: float
+    top_prob: float
 
-    text_preview: str | None = None
+    text_preview: str
 
     kakao_mode: str = "disabled"  # "disabled" | "real"
     kakao_ok: bool = False
@@ -198,7 +149,14 @@ class TrackingSnapshot(SQLModel, table=True):
 
 class PoseWindowRequest(BaseModel):
     agent_code: str
+    camera_id: str
+    source_id: str | None = None
+    window_index: int
+    keypoints: list[list[list[float]]]  # (T,33,4)
 
+
+class BehaviorResultResponse(BaseModel):
+    agent_code: str
     camera_id: str
     source_id: str | None = None
 
@@ -206,24 +164,15 @@ class PoseWindowRequest(BaseModel):
     window_start_ts: float | None = None
     window_end_ts: float | None = None
 
-    # (T,33,4) [x,y,z,visibility]
-    keypoints: list[list[list[float]]]
-
-
-class BehaviorResultResponse(BaseModel):
-    agent_code: str
-    camera_id: str
-    source_id: str | None
-
-    window_index: int
-    window_start_ts: float | None
-    window_end_ts: float | None
-
     is_anomaly: bool
     det_prob: float
-    top_label: str | None
-    top_prob: float
+    top_label: str | None = None
+    top_prob: float = 0.0
     prob: dict[str, float]
+
+
+class BehaviorResultListResponse(BaseModel):
+    results: list[BehaviorResultResponse]
 
 
 class TrackingBBox(BaseModel):
@@ -234,7 +183,7 @@ class TrackingBBox(BaseModel):
 
 
 class TrackingObjectResponse(BaseModel):
-    global_id: str | None
+    global_id: str | None = None
     local_track_id: int
     label: str
     confidence: float
@@ -250,148 +199,33 @@ class TrackingSnapshotResponse(BaseModel):
 
 
 # ---------------------------------------------------------
-# FastAPI 앱 / CORS
-# ---------------------------------------------------------
-
-app = FastAPI(title="GoD Behavior Inference Server", version="0.2.0")
-
-_allowed_origins_raw = os.getenv("ALLOWED_ORIGINS")  # 예: "http://localhost:3000,http://127.0.0.1:3000"
-if _allowed_origins_raw:
-    ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_raw.split(",") if o.strip()]
-else:
-    # 개발 편의를 위해 기본은 모두 허용, 필요 시 .env 에서 제한
-    ALLOWED_ORIGINS = ["*"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-logger.info("CORS enabled for origins: %r", ALLOWED_ORIGINS)
-
-# ---------------------------------------------------------
-# DB 초기화
+# 에이전트 / 상태 관리
 # ---------------------------------------------------------
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    SQLModel.metadata.create_all(engine)
-    load_models()
-    logger.info("Startup complete: DB tables ensured, models loaded.")
+def get_or_create_agent_by_code(session: Session, code: str) -> Agent:
+    stmt = select(Agent).where(Agent.code == code)
+    agent = session.exec(stmt).first()
+    if agent is not None:
+        return agent
 
-
-# ---------------------------------------------------------
-# 모델 로딩 (Prep_v3 기반)
-# ---------------------------------------------------------
-
-DET_CKPT_PATH = _resolve_env_path("DET_CKPT_PATH")
-CLS_CKPT_PATH = _resolve_env_path("CLS_CKPT_PATH")
-
-_detector: BehaviorDetector | None = None
-_classifier: BehaviorClassifier | None = None
-
-
-def get_detector() -> BehaviorDetector:
-    if _detector is None:
-        raise RuntimeError("BehaviorDetector is not initialized")
-    return _detector
-
-
-def get_classifier() -> BehaviorClassifier:
-    if _classifier is None:
-        raise RuntimeError("BehaviorClassifier is not initialized")
-    return _classifier
-
-
-def load_models() -> None:
-    global _detector, _classifier
-
-    det_cfg = BehaviorDetectorConfig(ckpt_path=DET_CKPT_PATH)
-    cls_cfg = BehaviorClassifierConfig(ckpt_path=CLS_CKPT_PATH)
-
-    _detector = BehaviorDetector(det_cfg)
-    _classifier = BehaviorClassifier(cls_cfg)
-
-    logger.info(
-        "Loaded models:\n"
-        "  DET_CKPT_PATH=%s (win=%s, feat_dim=%s)\n"
-        "  CLS_CKPT_PATH=%s (win=%s, classes=%s)",
-        DET_CKPT_PATH,
-        _detector.win,
-        _detector.feat_dim,
-        CLS_CKPT_PATH,
-        _classifier.win,
-        _classifier.events,
-    )
-
-
-def run_detection_from_keypoints(kpt_seq: NDArray[np.floating]) -> float:
-    """
-    kpt_seq: (T,33,4) -> p_anom
-    """
-    feat = features_from_pose_seq(kpt_seq)  # (T,169)
-    det = get_detector()
-    return det(feat)
-
-
-def run_classification_from_keypoints(
-    kpt_seq: NDArray[np.floating],
-) -> tuple[list[str], NDArray[np.float32]]:
-    """
-    kpt_seq: (T,33,4) -> (events, probs)
-    """
-    feat = features_from_pose_seq(kpt_seq)  # (T,169)
-    clsf = get_classifier()
-    prob_map = clsf(feat)  # dict[label->prob]
-
-    events = list(clsf.events)
-    probs = np.array([prob_map[label] for label in events], dtype=np.float32)
-    return events, probs
-
-
-# ---------------------------------------------------------
-# 이상행동 판정 파라미터 (EMA / voting / cooldown)
-# ---------------------------------------------------------
-
-EMA_ALPHA = _env_float("EMA_ALPHA", 0.3)
-DET_START_THR = _env_float("DET_START_THR", 0.8)
-DET_END_THR = _env_float("DET_END_THR", 0.55)
-
-DET_VOTE_WIN = _env_int("DET_VOTE_WIN", 5)
-DET_MIN_START_VOTES = _env_int("DET_MIN_START_VOTES", 4)
-DET_MIN_END_VOTES = _env_int("DET_MIN_END_VOTES", 4)
-
-DET_MIN_EVENT_SEC = _env_float("DET_MIN_EVENT_SEC", 2.0)
-DET_COOLDOWN_SEC = _env_float("DET_COOLDOWN_SEC", 2.0)
-
-logger.info(
-    "Detection params: EMA_ALPHA=%.3f, START_THR=%.3f, END_THR=%.3f, "
-    "VOTE_WIN=%d, MIN_START_VOTES=%d, MIN_END_VOTES=%d, "
-    "MIN_EVENT_SEC=%.1f, COOLDOWN_SEC=%.1f",
-    EMA_ALPHA,
-    DET_START_THR,
-    DET_END_THR,
-    DET_VOTE_WIN,
-    DET_MIN_START_VOTES,
-    DET_MIN_END_VOTES,
-    DET_MIN_EVENT_SEC,
-    DET_COOLDOWN_SEC,
-)
-
-# ---------------------------------------------------------
-# 상태 머신 (에이전트+카메라 단위)
-# ---------------------------------------------------------
+    agent = Agent(code=code)
+    session.add(agent)
+    session.commit()
+    session.refresh(agent)
+    logger.info("Created new agent: id=%s code=%s", agent.id, agent.code)
+    return agent
 
 
 @dataclass
 class BehaviorState:
-    ema_prob: float | None = None
-    in_event: bool = False
+    """카메라별 상태 관리용 구조체."""
 
+    ema: float = 0.0
+    last_window_index: int = -1
+
+    # 현재 진행 중인 이벤트 여부
+    in_event: bool = False
     event_label: str | None = None
     event_top_prob: float = 0.0
     event_start_ts: float | None = None
@@ -410,32 +244,119 @@ def _get_state(agent_id: int, camera_id: str) -> BehaviorState:
     st = _behavior_states.get(key)
     if st is None:
         st = BehaviorState(
-            ema_prob=None,
+            ema=0.0,
+            last_window_index=-1,
             in_event=False,
             event_label=None,
             event_top_prob=0.0,
             event_start_ts=None,
             event_start_window_index=None,
-            votes=deque(maxlen=DET_VOTE_WIN),
-            last_update_ts=time.time(),
+            votes=deque(maxlen=5),
+            last_update_ts=0.0,
         )
         _behavior_states[key] = st
     return st
 
 
 # ---------------------------------------------------------
-# Kakao 연동
+# 모델 로딩 (Prep_v3 기반)
 # ---------------------------------------------------------
 
-KAKAO_SEND_URL = os.getenv("KAKAO_SEND_URL", "https://kapi.kakao.com/v2/api/talk/memo/default/send")
+DET_CKPT_PATH = env_path("DET_CKPT_PATH", BASE_DIR)
+CLS_CKPT_PATH = env_path("CLS_CKPT_PATH", BASE_DIR)
 
 
-def _send_kakao_message(access_token: str, text: str) -> tuple[bool, int | None, str | None, str | None]:
-    """
-    실제 카카오 API 호출.
-    """
+_det_cfg: BehaviorDetectorConfig | None = None
+_cls_cfg: BehaviorClassifierConfig | None = None
+_detector: BehaviorDetector | None = None
+_classifier: BehaviorClassifier | None = None
+
+
+def get_detector() -> BehaviorDetector:
+    global _det_cfg, _detector
+    if _detector is None:
+        det_cfg = BehaviorDetectorConfig(ckpt_path=DET_CKPT_PATH)
+        _det_cfg = det_cfg
+        _detector = BehaviorDetector(det_cfg)
+        logger.info("Loaded BehaviorDetector from %s", DET_CKPT_PATH)
+    assert _detector is not None
+    return _detector
+
+
+def get_classifier() -> BehaviorClassifier:
+    global _cls_cfg, _classifier
+    if _classifier is None:
+        cls_cfg = BehaviorClassifierConfig(ckpt_path=CLS_CKPT_PATH)
+        _cls_cfg = cls_cfg
+        _classifier = BehaviorClassifier(cls_cfg)
+        logger.info("Loaded BehaviorClassifier from %s", CLS_CKPT_PATH)
+    assert _classifier is not None
+    return _classifier
+
+
+# ---------------------------------------------------------
+# 이상행동 판정 파라미터
+# ---------------------------------------------------------
+
+EMA_ALPHA = env_float("EMA_ALPHA", 0.3)
+DET_START_THR = env_float("DET_START_THR", 0.8)
+DET_END_THR = env_float("DET_END_THR", 0.55)
+
+DET_VOTE_WIN = env_int("DET_VOTE_WIN", 5)
+DET_MIN_START_VOTES = env_int("DET_MIN_START_VOTES", 4)
+DET_MIN_END_VOTES = env_int("DET_MIN_END_VOTES", 4)
+
+DET_MIN_EVENT_SEC = env_float("DET_MIN_EVENT_SEC", 2.0)
+DET_COOLDOWN_SEC = env_float("DET_COOLDOWN_SEC", 2.0)
+
+logger.info(
+    "Detection params: EMA_ALPHA=%.3f, START_THR=%.3f, END_THR=%.3f, "
+    "VOTE_WIN=%d, MIN_START_VOTES=%d, MIN_END_VOTES=%d, "
+    "MIN_EVENT_SEC=%.3f, COOLDOWN_SEC=%.3f",
+    EMA_ALPHA,
+    DET_START_THR,
+    DET_END_THR,
+    DET_VOTE_WIN,
+    DET_MIN_START_VOTES,
+    DET_MIN_END_VOTES,
+    DET_MIN_EVENT_SEC,
+    DET_COOLDOWN_SEC,
+)
+
+
+# ---------------------------------------------------------
+# Kakao 알림 설정
+# ---------------------------------------------------------
+
+KAKAO_SEND_URL = os.getenv(
+    "KAKAO_SEND_URL",
+    "https://kapi.kakao.com/v2/api/talk/memo/default/send",
+)
+
+
+def _format_event_text(
+    agent: Agent,
+    camera_id: str,
+    label: str,
+    duration_sec: float,
+    prob: float,
+) -> str:
+    return (
+        f"[이상행동 감지]\n\n"
+        f"- 에이전트: {agent.code}\n"
+        f"- 카메라: {camera_id}\n"
+        f"- 라벨: {label}\n"
+        f"- 지속시간: {duration_sec:.1f}초\n"
+        f"- 확률: {prob:.3f}\n"
+    )
+
+
+def _send_kakao_alarm(
+    kakao_access_token: str,
+    text: str,
+) -> tuple[bool, int | None, str | None, str | None]:
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {kakao_access_token}",
         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
     }
     payload = {
@@ -443,7 +364,10 @@ def _send_kakao_message(access_token: str, text: str) -> tuple[bool, int | None,
             {
                 "object_type": "text",
                 "text": text,
-                "link": {"web_url": "https://example.com", "mobile_web_url": "https://example.com"},
+                "link": {
+                    "web_url": "https://example.com",
+                    "mobile_web_url": "https://example.com",
+                },
             },
             ensure_ascii=False,
         )
@@ -466,97 +390,55 @@ def _send_kakao_message(access_token: str, text: str) -> tuple[bool, int | None,
 
 
 # ---------------------------------------------------------
-# 에이전트 헬퍼
+# FastAPI 앱
 # ---------------------------------------------------------
 
+app = FastAPI(title="Guardians of Dongne - Behavior Inference Server")
 
-def get_or_create_agent_by_code(session: Session, agent_code: str) -> Agent:
-    stmt = select(Agent).where(Agent.code == agent_code)
-    agent = session.exec(stmt).first()
-    if agent is None:
-        agent = Agent(code=agent_code)
-        session.add(agent)
-        session.commit()
-        session.refresh(agent)
-    return agent
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+)
 
-
-# ---------------------------------------------------------
-# 엔드포인트: 헬스 체크
-# ---------------------------------------------------------
-
-
-@app.get("/health")
-def health() -> dict[str, Any]:
-    return {"status": "ok", "time": time.time()}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[s.strip() for s in ALLOWED_ORIGINS.split(",") if s.strip()],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# ---------------------------------------------------------
-# 엔드포인트: 에이전트 / 카카오 토큰 등록
-# ---------------------------------------------------------
-
-
-class AgentRegisterRequest(BaseModel):
-    agent_code: str
-    kakao_access_token: str
-    note: str | None = None
-
-
-@app.post("/agent/register_kakao")
-def register_kakao(
-    payload: AgentRegisterRequest,
-    session: Session = Depends(get_session),
-) -> dict[str, Any]:
-    agent = get_or_create_agent_by_code(session, payload.agent_code)
-    agent.kakao_access_token = payload.kakao_access_token
-    agent.note = payload.note
-    agent.updated_at = time.time()
-    session.add(agent)
-    session.commit()
-    logger.info("Registered Kakao token for agent_code=%s (id=%s)", agent.code, agent.id)
-    return {"ok": True, "agent_id": agent.id}
-
-
-@app.get("/kakao/test")
-def kakao_test(
-    agent_code: str,
-    session: Session = Depends(get_session),
-) -> dict[str, Any]:
-    stmt = select(Agent).where(Agent.code == agent_code)
-    agent = session.exec(stmt).first()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="agent not found")
-    if not agent.kakao_access_token:
-        raise HTTPException(status_code=400, detail="agent has no kakao_access_token")
-
-    text = f"[테스트] 에이전트 {agent.code} Kakao 테스트 메시지입니다."
-    ok, status_code, err, raw = _send_kakao_message(agent.kakao_access_token, text)
-
-    log = KakaoAlarmLog(
-        agent_id=agent.id,
-        camera_id="__kakao_test__",
-        source_id=None,
-        event_label="__kakao_test__",
-        start_window_index=None,
-        end_window_index=None,
-        duration_sec=None,
-        top_prob=None,
-        text_preview=text,
-        kakao_mode="real",
-        kakao_ok=ok,
-        kakao_status_code=status_code,
-        kakao_error=err,
-        kakao_raw_response_json=raw,
-    )
-    session.add(log)
-    session.commit()
-
-    return {"ok": ok, "status_code": status_code, "error": err}
+@app.on_event("startup")
+def on_startup() -> None:
+    SQLModel.metadata.create_all(engine)
+    logger.info("Database tables ensured.")
 
 
 # ---------------------------------------------------------
 # 엔드포인트: 포즈 기반 이상행동 분석
 # ---------------------------------------------------------
+
+
+def run_detection_from_keypoints(kpt_seq: NDArray[np.floating]) -> float:
+    """
+    kpt_seq: (T,33,4) -> p_anom
+    """
+    feat = features_from_pose_seq(kpt_seq)  # (T,169)
+    det = get_detector()
+    return det(feat)
+
+
+def run_classification_from_keypoints(
+    kpt_seq: NDArray[np.floating],
+) -> tuple[list[str], NDArray[np.float32]]:
+    """
+    kpt_seq: (T,33,4) -> (labels, probs)
+    """
+    feat = features_from_pose_seq(kpt_seq)  # (T,169)
+    cls_model = get_classifier()
+    labels, probs = cls_model.predict_proba(feat)
+    return labels, probs
 
 
 @app.post("/behavior/analyze_pose", response_model=BehaviorResultResponse)
@@ -585,255 +467,216 @@ def analyze_pose(
     top_label: str | None
     top_prob: float
     if prob_map:
-        top_label, top_prob = max(prob_map.items(), key=lambda kv: kv[1])
+        top_label = max(prob_map, key=prob_map.get)
+        top_prob = prob_map[top_label]
     else:
-        top_label, top_prob = None, 0.0
+        top_label = None
+        top_prob = 0.0
 
-    # 4) EMA 업데이트
-    prev_ema = state.ema_prob
-    if prev_ema is None:
-        ema = p_anom
-    else:
-        ema = EMA_ALPHA * p_anom + (1.0 - EMA_ALPHA) * prev_ema
-    state.ema_prob = ema
-    state.last_update_ts = time.time()
-
-    # 5) voting
-    vote: bool | None
-    if ema >= DET_START_THR:
-        vote = True
-    elif ema <= DET_END_THR:
-        vote = False
-    else:
-        vote = None
-    state.votes.append(vote)
-
-    # 6) START / END 판정
-    is_anomaly_window = ema >= DET_START_THR
+    # 4) EMA / voting 기반 이벤트 상태 업데이트
     now_ts = time.time()
-    win_start_ts = payload.window_start_ts if payload.window_start_ts is not None else now_ts
-    win_end_ts = payload.window_end_ts if payload.window_end_ts is not None else now_ts
+    state.last_update_ts = now_ts
 
-    def _count_votes(vs: deque[Any], target: bool | None) -> int:
-        return sum(1 for v in vs if v is target)
+    prev_ema = state.ema
+    ema = EMA_ALPHA * p_anom + (1.0 - EMA_ALPHA) * prev_ema
+    state.ema = ema
 
-    # 이벤트 시작
-    if not state.in_event:
-        start_votes = _count_votes(state.votes, True)
-        if ema >= DET_START_THR and start_votes >= DET_MIN_START_VOTES:
-            state.in_event = True
-            state.event_label = top_label
-            state.event_top_prob = top_prob
-            state.event_start_ts = win_start_ts
-            state.event_start_window_index = payload.window_index
-            logger.info(
-                "[EVENT START] agent=%s cam=%s win=%s label=%s ema=%.3f p=%.3f",
-                agent.code,
-                payload.camera_id,
-                payload.window_index,
-                top_label,
-                ema,
-                p_anom,
-            )
-    else:
-        # 이벤트 종료 후보
-        end_votes = _count_votes(state.votes, False) + _count_votes(state.votes, None)
-        duration_sec = (win_end_ts - (state.event_start_ts or win_start_ts)) if state.event_start_ts else 0.0
+    is_anomaly_window = ema >= DET_START_THR
 
-        if ema <= DET_END_THR and end_votes >= DET_MIN_END_VOTES:
-            # 쿨다운/최소 길이 체크
-            if duration_sec >= DET_MIN_EVENT_SEC:
-                # END 확정 → 카카오/로그
-                _handle_event_end(
-                    session=session,
-                    agent=agent,
-                    payload=payload,
-                    state=state,
-                    duration_sec=duration_sec,
-                )
-            else:
-                logger.info(
-                    "[EVENT SHORT] agent=%s cam=%s win=%s duration=%.2fs (< %.2fs)",
-                    agent.code,
-                    payload.camera_id,
-                    payload.window_index,
-                    duration_sec,
-                    DET_MIN_EVENT_SEC,
-                )
+    # votes deque 업데이트
+    if state.votes is None:
+        state.votes = deque(maxlen=DET_VOTE_WIN)  # type: ignore[assignment]
+    votes = state.votes
+    votes.append(is_anomaly_window)
 
-            # 상태 리셋 + 쿨다운
-            state.in_event = False
-            state.event_label = None
-            state.event_top_prob = 0.0
-            state.event_start_ts = None
-            state.event_start_window_index = None
-            state.votes.clear()
-            state.last_update_ts = now_ts
+    start_votes = sum(1 for v in votes if v is True)
+    end_votes = sum(1 for v in votes if v is False)
 
-    # 7) inference_results 저장
-    stage1_normal = float(1.0 - p_anom)
-    stage1_anomaly = float(p_anom)
+    event_ended = False
+    event_label: str | None = None
+    event_duration_sec: float = 0.0
+    event_start_index_for_log: int | None = None
 
-    res = InferenceResult(
+    # 이벤트 시작 조건
+    if (
+        not state.in_event
+        and ema >= DET_START_THR
+        and start_votes >= DET_MIN_START_VOTES
+    ):
+        state.in_event = True
+        state.event_label = top_label
+        state.event_top_prob = top_prob
+        state.event_start_ts = now_ts
+        state.event_start_window_index = payload.window_index
+
+        logger.info(
+            "[EVENT START] agent=%s cam=%s label=%s win_idx=%s ema=%.3f p_anom=%.3f",
+            agent.code,
+            payload.camera_id,
+            top_label,
+            payload.window_index,
+            ema,
+            p_anom,
+        )
+
+    # 이벤트 종료 조건
+    elif (
+        state.in_event
+        and ema <= DET_END_THR
+        and end_votes >= DET_MIN_END_VOTES
+    ):
+        # 로그용으로 시작 인덱스/라벨 보관
+        event_label = state.event_label
+        event_start_index_for_log = state.event_start_window_index
+
+        if state.event_start_ts is not None:
+            event_duration_sec = now_ts - state.event_start_ts
+        else:
+            event_duration_sec = 0.0
+
+        if event_duration_sec >= DET_MIN_EVENT_SEC:
+            event_ended = True
+
+        logger.info(
+            "[EVENT END-CANDIDATE] agent=%s cam=%s label=%s duration=%.2fs ema=%.3f p_anom=%.3f",
+            agent.code,
+            payload.camera_id,
+            event_label,
+            event_duration_sec,
+            ema,
+            p_anom,
+        )
+
+        # 상태 초기화 + 쿨다운
+        state.in_event = False
+        state.event_label = None
+        state.event_top_prob = 0.0
+        state.event_start_ts = None
+        state.event_start_window_index = None
+
+        if event_ended:
+            state.last_update_ts = now_ts + DET_COOLDOWN_SEC
+
+    # 5) DB 기록 (BehaviorResult)
+    is_anomaly = ema >= DET_START_THR
+    result = BehaviorResult(
         agent_id=agent.id,
         camera_id=payload.camera_id,
         source_id=payload.source_id,
         window_index=payload.window_index,
-        window_start_ts=payload.window_start_ts,
-        window_end_ts=payload.window_end_ts,
-        is_anomaly=is_anomaly_window,
-        stage1_normal=stage1_normal,
-        stage1_anomaly=stage1_anomaly,
+        window_start_ts=None,
+        window_end_ts=None,
+        is_anomaly=is_anomaly,
+        stage1_normal=1.0 - p_anom,
+        stage1_anomaly=p_anom,
         stage2_labels_json=json.dumps(events, ensure_ascii=False),
         stage2_probs_json=json.dumps(probs.tolist(), ensure_ascii=False),
         stage2_top_label=top_label,
         stage2_top_prob=top_prob,
     )
-    session.add(res)
+    session.add(result)
     session.commit()
+    session.refresh(result)
+
+    # 6) Kakao 알림 (이벤트 종료 시)
+    if event_ended and event_label is not None:
+        kakao_access_token = os.getenv("KAKAO_ACCESS_TOKEN")
+        kakao_mode = "disabled"
+        kakao_ok = False
+        kakao_status_code: int | None = None
+        kakao_error: str | None = None
+        kakao_raw_json: str | None = None
+
+        text = ""
+        if kakao_access_token:
+            kakao_mode = "real"
+            text = _format_event_text(
+                agent=agent,
+                camera_id=payload.camera_id,
+                label=event_label,
+                duration_sec=event_duration_sec,
+                prob=state.event_top_prob,
+            )
+            kakao_ok, kakao_status_code, kakao_error, kakao_raw_json = _send_kakao_alarm(
+                kakao_access_token,
+                text,
+            )
+            logger.info(
+                "Kakao send: ok=%s status=%s error=%s",
+                kakao_ok,
+                kakao_status_code,
+                kakao_error,
+            )
+        else:
+            kakao_mode = "disabled"
+            logger.info(
+                "Kakao disabled for agent_code=%s (no kakao_access_token), event=%s",
+                agent.code,
+                event_label,
+            )
+
+        log = KakaoAlarmLog(
+            agent_id=agent.id,
+            camera_id=payload.camera_id,
+            source_id=payload.source_id,
+            event_label=event_label,
+            start_window_index=event_start_index_for_log,
+            end_window_index=payload.window_index,
+            duration_sec=event_duration_sec,
+            top_prob=state.event_top_prob,
+            text_preview=text[:2000] if kakao_access_token else "",
+            kakao_mode=kakao_mode,
+            kakao_ok=kakao_ok,
+            kakao_status_code=kakao_status_code,
+            kakao_error=kakao_error,
+            kakao_raw_response_json=kakao_raw_json,
+        )
+        session.add(log)
+        session.commit()
+
+        logger.info(
+            "[EVENT END] agent=%s cam=%s label=%s duration=%.2fs kakao_mode=%s kakao_ok=%s",
+            agent.code,
+            payload.camera_id,
+            event_label,
+            event_duration_sec,
+            kakao_mode,
+            kakao_ok,
+        )
 
     return BehaviorResultResponse(
         agent_code=agent.code,
         camera_id=payload.camera_id,
         source_id=payload.source_id,
         window_index=payload.window_index,
-        window_start_ts=payload.window_start_ts,
-        window_end_ts=payload.window_end_ts,
-        is_anomaly=is_anomaly_window,
-        det_prob=float(ema),
+        window_start_ts=None,
+        window_end_ts=None,
+        is_anomaly=is_anomaly,
+        det_prob=p_anom,
         top_label=top_label,
         top_prob=top_prob,
         prob=prob_map,
     )
 
 
-def _handle_event_end(
-    session: Session,
-    agent: Agent,
-    payload: PoseWindowRequest,
-    state: BehaviorState,
-    duration_sec: float,
-) -> None:
-    """
-    이벤트 END 시점에 Kakao + kakao_alarm_log 기록.
-    """
-    label = state.event_label or "__unknown__"
-    text = (
-        f"[이상행동 감지]\n"
-        f"- 에이전트: {agent.code}\n"
-        f"- 카메라: {payload.camera_id}\n"
-        f"- 이벤트: {label}\n"
-        f"- 지속시간: {duration_sec:.1f}초\n"
-        f"- 윈도우: {state.event_start_window_index} ~ {payload.window_index}\n"
-    )
-
-    kakao_mode = "disabled"
-    kakao_ok = False
-    kakao_status_code: int | None = None
-    kakao_error: str | None = None
-    kakao_raw_json: str | None = None
-
-    if agent.kakao_access_token:
-        kakao_mode = "real"
-        kakao_ok, kakao_status_code, kakao_error, kakao_raw_json = _send_kakao_message(
-            agent.kakao_access_token,
-            text,
-        )
-    else:
-        kakao_mode = "disabled"
-        logger.info(
-            "Kakao disabled for agent_code=%s (no kakao_access_token), event=%s",
-            agent.code,
-            label,
-        )
-
-    log = KakaoAlarmLog(
-        agent_id=agent.id,
-        camera_id=payload.camera_id,
-        source_id=payload.source_id,
-        event_label=label,
-        start_window_index=state.event_start_window_index,
-        end_window_index=payload.window_index,
-        duration_sec=duration_sec,
-        top_prob=state.event_top_prob,
-        text_preview=text[:2000],
-        kakao_mode=kakao_mode,
-        kakao_ok=kakao_ok,
-        kakao_status_code=kakao_status_code,
-        kakao_error=kakao_error,
-        kakao_raw_response_json=kakao_raw_json,
-    )
-    session.add(log)
-    session.commit()
-
-    logger.info(
-        "[EVENT END] agent=%s cam=%s label=%s duration=%.2fs kakao_mode=%s kakao_ok=%s",
-        agent.code,
-        payload.camera_id,
-        label,
-        duration_sec,
-        kakao_mode,
-        kakao_ok,
-    )
-
-
-# ---------------------------------------------------------
-# 엔드포인트: Behavior 최신 결과 조회 (UI용)
-# ---------------------------------------------------------
-
-
-@app.get("/behavior/latest/{camera_id}", response_model=BehaviorResultResponse | None)
-def behavior_latest_for_camera(
-    camera_id: str,
-    agent_code: str,
-    session: Session = Depends(get_session),
-) -> BehaviorResultResponse | None:
-    agent = get_or_create_agent_by_code(session, agent_code)
-    stmt = (
-        select(InferenceResult)
-        .where(InferenceResult.agent_id == agent.id, InferenceResult.camera_id == camera_id)
-        .order_by(InferenceResult.id.desc())
-        .limit(1)
-    )
-    row = session.exec(stmt).first()
-    if row is None:
-        return None
-
-    events = json.loads(row.stage2_labels_json)
-    probs = json.loads(row.stage2_probs_json)
-    prob_map = {label: float(p) for label, p in zip(events, probs)}
-
-    return BehaviorResultResponse(
-        agent_code=agent.code,
-        camera_id=row.camera_id,
-        source_id=row.source_id,
-        window_index=row.window_index,
-        window_start_ts=row.window_start_ts,
-        window_end_ts=row.window_end_ts,
-        is_anomaly=row.is_anomaly,
-        det_prob=row.stage1_anomaly,  # EMA 대신 마지막 anomaly prob 저장 원하면 변경
-        top_label=row.stage2_top_label,
-        top_prob=row.stage2_top_prob,
-        prob=prob_map,
-    )
-
-
-@app.get("/behavior/latest_all", response_model=list[BehaviorResultResponse])
-def behavior_latest_all(
+@app.get(
+    "/behavior/latest_by_camera",
+    response_model=list[BehaviorResultResponse],
+)
+def behavior_latest_by_camera(
     agent_code: str,
     session: Session = Depends(get_session),
 ) -> list[BehaviorResultResponse]:
     agent = get_or_create_agent_by_code(session, agent_code)
 
-    # camera_id 별 마지막 row
     stmt = (
-        select(InferenceResult)
-        .where(InferenceResult.agent_id == agent.id)
-        .order_by(InferenceResult.camera_id, InferenceResult.id.desc())
+        select(BehaviorResult)
+        .where(BehaviorResult.agent_id == agent.id)
+        .order_by(BehaviorResult.id.desc())
     )
     rows = session.exec(stmt).all()
 
-    latest_by_camera: dict[str, InferenceResult] = {}
+    latest_by_camera: dict[str, BehaviorResult] = {}
     for r in rows:
         if r.camera_id not in latest_by_camera:
             latest_by_camera[r.camera_id] = r
@@ -864,11 +707,64 @@ def behavior_latest_all(
 
 
 # ---------------------------------------------------------
-# 트래킹: 설정 / 엔드포인트 (YOLO는 나중에 붙이고, 일단 no-op + DB 저장)
+# 트래킹: 설정 / 엔드포인트 (YOLO+DeepSORT + optional ReID/Global ID)
 # ---------------------------------------------------------
 
-TRACKING_ENABLED = _env_bool("TRACKING_ENABLED", False)
-logger.info("Tracking enabled: %s", TRACKING_ENABLED)
+TRACKING_ENABLED = env_bool("TRACKING_ENABLED", False)
+TRACK_ENABLE_REID = env_bool("TRACK_ENABLE_REID", False)
+TRACK_ENABLE_GLOBAL_ID = env_bool("TRACK_ENABLE_GLOBAL_ID", False)
+
+_tracking_engine: MultiCameraTracker | None = None
+
+
+def get_tracking_engine() -> MultiCameraTracker | None:
+    """TRACKING_ENABLED 이고 설정이 정상일 때만 트래킹 엔진을 반환한다."""
+    global _tracking_engine
+
+    if not TRACKING_ENABLED:
+        return None
+
+    if _tracking_engine is not None:
+        return _tracking_engine
+
+    # .env 에서 트래킹 관련 파라미터 읽기
+    yolo_weights_path = env_path("TRACK_YOLO_WEIGHTS", BASE_DIR)
+    conf_thres = env_float("TRACK_CONF_THRESH", 0.5)
+    iou_thres = env_float("TRACK_IOU_THRESH", 0.7)
+    max_age = env_int("TRACK_MAX_AGE", 30)
+
+    enable_reid = TRACK_ENABLE_REID
+    enable_global_id = TRACK_ENABLE_GLOBAL_ID
+
+    reid_dist_thres = env_float("TRACK_REID_DIST_THRES", 0.25)
+    reid_model_name = env_str("TRACK_REID_MODEL_NAME", "osnet_x1_0")
+
+    # 선택적인 ReID weight 경로 (없으면 None)
+    try:
+        reid_model_path = env_path("TRACK_REID_MODEL_PATH", BASE_DIR)
+        reid_model_path_str: str | None = str(reid_model_path)
+    except RuntimeError:
+        reid_model_path_str = None
+
+    _tracking_engine = MultiCameraTracker(
+        yolo_weights=str(yolo_weights_path),
+        conf_thres=conf_thres,
+        iou_thres=iou_thres,
+        max_age=max_age,
+        reid_cosine_thres=reid_dist_thres,
+        reid_model_name=reid_model_name,
+        reid_model_path=reid_model_path_str,
+        enable_reid=enable_reid,
+        enable_global_id=enable_global_id,
+    )
+    logger.info(
+        "Tracking engine initialized: enabled=%s, reid=%s, global_id=%s, weights=%s",
+        TRACKING_ENABLED,
+        enable_reid,
+        enable_global_id,
+        yolo_weights_path,
+    )
+    return _tracking_engine
 
 
 @app.post("/tracking")
@@ -880,31 +776,50 @@ async def tracking_endpoint(
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """
-    트래킹용 프레임 업로드 엔드포인트.
-
-    현재는 YOLO/DeepSort 를 실제로 돌리지는 않고,
-    TRACKING_ENABLED=False 여도 엔드포인트는 정상 응답을 돌려준다.
-
-    - TrackingSnapshot 에는 objects_json="[]" 으로 비워서 저장해 둔다.
-      (나중에 YOLO を 붙이면 이 부분을 실제 결과로 대체)
-    """
+    """트래킹용 프레임 업로드 엔드포인트."""
     agent = get_or_create_agent_by_code(session, agent_code)
 
-    # 프레임 바이트는 지금은 사용하지 않고 버린다.
-    _ = await file.read()
-
+    frame_bytes = await file.read()
     ts = timestamp if timestamp is not None else time.time()
 
     objects_list: list[dict[str, Any]] = []
 
-    if TRACKING_ENABLED:
-        # TODO: 나중에 modeling.tracking.yolo_deepsort.YoloDeepSortEngine 을 붙이면,
-        #       여기서 JPEG -> BGR -> engine.track(...) 호출 후 결과를 objects_list 로 채운다.
-        logger.warning(
-            "TRACKING_ENABLED=True 이지만 YOLO 엔진이 아직 구현되지 않았습니다. "
-            "objects_json 은 빈 배열로 저장됩니다."
+    engine = get_tracking_engine()
+    if engine is None:
+        logger.info(
+            "tracking disabled: TRACKING_ENABLED=False (camera_id=%s)",
+            camera_id,
         )
+    else:
+        np_arr = np.frombuffer(frame_bytes, np.uint8)
+        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if frame_bgr is None:
+            logger.warning(
+                "tracking: JPEG frame decode failed (camera_id=%s)",
+                camera_id,
+            )
+        else:
+            tracks: list[TrackResult] = engine.process_frame(
+                camera_id=camera_id,
+                frame_bgr=frame_bgr,
+                timestamp=ts,
+            )
+            for t in tracks:
+                objects_list.append(
+                    {
+                        "global_id": t.global_id,
+                        "local_track_id": t.local_track_id,
+                        "label": t.label,
+                        "confidence": float(t.confidence),
+                        "bbox": {
+                            "x": float(t.bbox.x),
+                            "y": float(t.bbox.y),
+                            "w": float(t.bbox.w),
+                            "h": float(t.bbox.h),
+                        },
+                    }
+                )
 
     snap = TrackingSnapshot(
         agent_id=agent.id,
@@ -935,7 +850,10 @@ def tracking_latest_for_camera(
     agent = get_or_create_agent_by_code(session, agent_code)
     stmt = (
         select(TrackingSnapshot)
-        .where(TrackingSnapshot.agent_id == agent.id, TrackingSnapshot.camera_id == camera_id)
+        .where(
+            TrackingSnapshot.agent_id == agent.id,
+            TrackingSnapshot.camera_id == camera_id,
+        )
         .order_by(TrackingSnapshot.id.desc())
         .limit(1)
     )
@@ -981,7 +899,7 @@ def tracking_latest_all(
     stmt = (
         select(TrackingSnapshot)
         .where(TrackingSnapshot.agent_id == agent.id)
-        .order_by(TrackingSnapshot.camera_id, TrackingSnapshot.id.desc())
+        .order_by(TrackingSnapshot.id.desc())
     )
     rows = session.exec(stmt).all()
 
