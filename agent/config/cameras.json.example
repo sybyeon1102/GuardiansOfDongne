@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "cameras": [
+    {
+      "id": "front-door",
+      "display_name": "Main Entrance",
+      "type": "rtsp",
+      "source": "rtsp://USER:PASS@192.168.0.10:554/stream1",
+      "expected_fps": 30,
+      "tracking_send_fps": 10,
+      "downscale": "half",
+      "enabled": true
+    },
+    {
+      "id": "back-door",
+      "display_name": "Back Door",
+      "type": "rtsp",
+      "source": "rtsp://USER:PASS@192.168.0.11:554/stream1",
+      "expected_fps": 25,
+      "tracking_send_fps": 5,
+      "downscale": "half",
+      "enabled": true
+    },
+    {
+      "id": "notebook-webcam",
+      "display_name": "Notebook Cam",
+      "type": "webcam",
+      "source": 0,
+      "expected_fps": 30,
+      "tracking_send_fps": 10,
+      "downscale": "none",
+      "enabled": true
+    },
+    {
+      "id": "test-file",
+      "display_name": "Test Clip (Looped)",
+      "type": "file",
+      "source": "/path/to/test_clip.mp4",
+      "expected_fps": 30,
+      "tracking_send_fps": 10,
+      "downscale": "half",
+      "file_mode": "loop",
+      "enabled": false
+    }
+  ]
+}
