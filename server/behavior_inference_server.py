@@ -336,7 +336,7 @@ def features_from_buf(buf: list[np.ndarray]) -> np.ndarray:
     def pick(i: int) -> np.ndarray:
         return xy_n[:, i, :]
 
-    angs = np.stack(
+    angs = np.concatenate(
         [
             ang(pick(11), pick(13), pick(15)),
             ang(pick(12), pick(14), pick(16)),

@@ -1,5 +1,5 @@
 import os
-import re
+import json
 import shutil
 import subprocess
 import threading
@@ -8,16 +8,19 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Any
 
 import cv2
 import mediapipe as mp
 import numpy as np
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
 
 # =========================================================
 # .env 로딩 (agent 디렉터리 기준)
@@ -31,133 +34,102 @@ load_dotenv(BASE_DIR / ".env")
 # 환경 변수 / 기본 설정
 # =========================================================
 
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 INFERENCE_SERVER_URL_DEFAULT = "http://localhost:8000"
-INFERENCE_SERVER_URL = os.getenv("INFERENCE_SERVER_URL", INFERENCE_SERVER_URL_DEFAULT)
+INFERENCE_SERVER_URL = os.getenv("INFERENCE_SERVER_URL", INFERENCE_SERVER_URL_DEFAULT).rstrip("/")
 
-SOURCES_ENV = os.getenv("AGENT_SOURCES", "videos/cam01.mp4,videos/cam02.mp4")
-CAMERA_IDS_ENV = os.getenv("AGENT_CAMERA_IDS", "cam01,cam02")
+AGENT_CODE = os.getenv("AGENT_CODE", "agent-unknown")
 
-DEFAULT_WINDOW_SIZE = int(os.getenv("AGENT_WINDOW_SIZE", "16"))
-DEFAULT_STRIDE = int(os.getenv("AGENT_STRIDE", "4"))
-DEFAULT_RESIZE_WIDTH = int(os.getenv("AGENT_RESIZE_WIDTH", "640"))
-DEFAULT_FRAME_SKIP = int(os.getenv("AGENT_FRAME_SKIP", "1"))  # 1이면 매 프레임 처리
+CAMERA_CONFIG_PATH = os.getenv("CAMERA_CONFIG_PATH", str((BASE_DIR / "config" / "cameras.json").resolve()))
 
-HLS_ROOT = Path(os.getenv("AGENT_HLS_ROOT", "./hls")).resolve()
+STREAM_HTTP_HOST = os.getenv("STREAM_HTTP_HOST", "0.0.0.0")
+STREAM_HTTP_PORT = int(os.getenv("STREAM_HTTP_PORT", "8001"))
+
+MJPEG_ENABLED = _env_bool("MJPEG_ENABLED", "true")
+HLS_ENABLED = _env_bool("HLS_ENABLED", "false")
+
+HLS_ROOT = Path(os.getenv("HLS_OUTPUT_DIR", "./hls")).resolve()
+HLS_BASE_PATH = os.getenv("HLS_BASE_PATH", "/streams")
+
+POSE_WINDOW_SIZE = int(os.getenv("POSE_WINDOW_SIZE", "30"))
+POSE_WINDOW_STRIDE = int(os.getenv("POSE_WINDOW_STRIDE", "15"))
+POSE_MAX_FPS = float(os.getenv("POSE_MAX_FPS", "30"))
+
+TRACKING_SEND_FPS_DEFAULT = float(os.getenv("TRACKING_SEND_FPS_DEFAULT", "10"))
+TRACKING_DOWNSCALE_MODE = os.getenv("TRACKING_DOWNSCALE_MODE", "half")  # none | half
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+REQUEST_TIMEOUT_SEC = float(os.getenv("REQUEST_TIMEOUT_SEC", "5"))
 
 
 # =========================================================
-# 서버와 맞춘 요청/응답 스키마
+# 서버와 맞춘 요청/응답 스키마 (FastAPI 서버 behavior_inference_server.py 참고)
 # =========================================================
+
 
 class PoseWindowRequest(BaseModel):
+    # 서버 쪽 PoseWindowRequest 와 동일하게 맞춘다.
+    agent_code: str
     camera_id: str
     source_id: str | None = None
     window_index: int
     window_start_ts: float | None = None
     window_end_ts: float | None = None
-    # keypoints: (T, 33, 4) 리스트
-    #   [[ [x,y,z,vis], ...33 ], ...T ]
+    # (T,33,4): [[ [x,y,z,vis], ...33 ], ...T ]
     keypoints: list[list[list[float]]]
 
 
 class InferenceResult(BaseModel):
+    # BehaviorResultResponse 와 최대한 맞춘다.
+    agent_code: str
     camera_id: str
-    source_id: str | None
+    source_id: str | None = None
     window_index: int
-    window_start_ts: float | None
-    window_end_ts: float | None
+    window_start_ts: float | None = None
+    window_end_ts: float | None = None
+
     is_anomaly: bool
-    det_prob: float
-    top_label: str | None
+    det_prob: float            # 현재 EMA 기준 이상 확률
+    top_label: str | None = None
     top_prob: float
     prob: dict[str, float]
+
+
+class CameraStatus(str):
+    ONLINE = "online"
+    OFFLINE = "offline"
+    STARTING = "starting"
+    ERROR = "error"
+
+
+class CameraSourceType(str):
+    RTSP = "rtsp"
+    FILE = "file"
+    WEBCAM = "webcam"
+
+
+class CameraSummary(BaseModel):
+    id: str
+    display_name: str
+    type: str
+    status: str
+    reason: str | None = None
+    mjpeg_url: str | None = None
+    hls_url: str | None = None
+    width: int | None = None
+    height: int | None = None
+    expected_fps: float | None = None
+    tracking_send_fps: float | None = None
+    downscale: str | None = None
 
 
 # =========================================================
 # 설정/유틸
 # =========================================================
-
-def looks_live_src(src: str) -> bool:
-    return bool(re.match(r"^(rtsp|rtsps|rtmp|http|https|rtp)://", src, re.I))
-
-
-@dataclass
-class CameraConfig:
-    camera_id: str
-    source: str            # mp4 경로 또는 rtsp://...
-    source_id: str         # DB/로그에 찍을 식별자
-    window_size: int = DEFAULT_WINDOW_SIZE
-    stride: int = DEFAULT_STRIDE
-    resize_width: int = DEFAULT_RESIZE_WIDTH
-    frame_skip: int = DEFAULT_FRAME_SKIP
-
-    @property
-    def is_live(self) -> bool:
-        return looks_live_src(self.source)
-
-    @property
-    def hls_root(self) -> Path:
-        return HLS_ROOT
-
-    @property
-    def hls_dir(self) -> Path:
-        return self.hls_root / self.camera_id
-
-    @property
-    def hls_playlist(self) -> Path:
-        return self.hls_dir / "index.m3u8"
-
-
-def parse_camera_env() -> list[CameraConfig]:
-    """
-    AGENT_SOURCES / AGENT_CAMERA_IDS 환경변수를 파싱해서
-    CameraConfig 리스트로 변환한다.
-
-    - 스트림 주소(rtsp/http/rtmp 등)는 그대로 사용
-    - 파일 경로는:
-        * ~ (홈 경로) 확장
-        * 환경변수($HOME 등) 확장
-        * BASE_DIR(= agent_app.py 가 있는 디렉터리) 기준 절대경로로 변환
-    """
-    src_tokens = [s.strip() for s in SOURCES_ENV.split(",") if s.strip()]
-    id_tokens = [s.strip() for s in CAMERA_IDS_ENV.split(",") if s.strip()]
-
-    n = min(len(src_tokens), len(id_tokens))
-    if n == 0:
-        raise RuntimeError("AGENT_SOURCES / AGENT_CAMERA_IDS 설정이 비었습니다.")
-
-    configs: list[CameraConfig] = []
-
-    for i in range(n):
-        raw_src = src_tokens[i]
-        cam_id = id_tokens[i]
-
-        # 1) 스트림 주소(rtsp/http/rtmp 등)라면 그대로 사용
-        if looks_live_src(raw_src):
-            source_str = raw_src
-            source_id = raw_src
-        else:
-            # 2) 파일 경로라면:
-            #   - ~ (홈) 확장
-            #   - 환경변수($HOME 등) 확장
-            #   - BASE_DIR 기준 절대 경로로 변환
-            expanded = os.path.expandvars(os.path.expanduser(raw_src))
-            src_path = Path(expanded)
-
-            if not src_path.is_absolute():
-                src_path = (BASE_DIR / src_path).resolve()
-
-            source_str = str(src_path)
-            source_id = source_str  # 필요하면 나중에 basename 등으로 바꿔도 됨
-
-        cfg = CameraConfig(
-            camera_id=cam_id,
-            source=source_str,
-            source_id=source_id,
-        )
-        configs.append(cfg)
-
-    return configs
 
 
 def ensure_ffmpeg_available() -> None:
@@ -173,23 +145,199 @@ def ensure_ffmpeg_available() -> None:
         )
         raise RuntimeError(msg)
 
+
+def _expand_source_path(raw_src: str) -> str:
+    """
+    파일 경로일 때 ~, 환경변수, BASE_DIR 기준 상대경로 등을 모두 처리한다.
+    스트림(rtsp/http/rtmp…)이면 그대로 반환.
+    """
+    if looks_live_src(raw_src):
+        return raw_src
+
+    expanded = os.path.expandvars(os.path.expanduser(raw_src))
+    src_path = Path(expanded)
+    if not src_path.is_absolute():
+        src_path = (BASE_DIR / src_path).resolve()
+    return str(src_path)
+
+
+def looks_live_src(src: str) -> bool:
+    """
+    rtsp/http/rtmp 등 "라이브 스트림" 주소처럼 보이는지 간단히 판별.
+    """
+    import re as _re
+
+    return bool(_re.match(r"^(rtsp|rtsps|rtmp|http|https|rtp)://", src, _re.I))
+
+
+@dataclass
+class CameraConfig:
+    camera_id: str
+    display_name: str
+    type: str  # "rtsp" | "file" | "webcam"
+    source: str
+    expected_fps: float | None = None
+    tracking_send_fps: float | None = None
+    downscale: str = TRACKING_DOWNSCALE_MODE  # "none" | "half"
+    enabled: bool = True
+    file_mode: str | None = None  # "loop" | "once" (file 일 때)
+
+    # Pose 윈도우 설정 (전역값을 기본으로 사용)
+    window_size: int = POSE_WINDOW_SIZE
+    window_stride: int = POSE_WINDOW_STRIDE
+    resize_width: int = 640  # Pose 입력 해상도 가로 기준
+    frame_skip: int = 1      # 1이면 매 프레임 처리
+
+    @property
+    def is_live(self) -> bool:
+        # rtsp / webcam 은 live, file 은 offline 재생
+        return self.type in {CameraSourceType.RTSP, CameraSourceType.WEBCAM}
+
+    @property
+    def source_id(self) -> str:
+        # 지금은 source 문자열 전체를 source_id 로 사용
+        return self.source
+
+    @property
+    def hls_dir(self) -> Path:
+        return HLS_ROOT / self.camera_id
+
+    @property
+    def hls_playlist(self) -> Path:
+        return self.hls_dir / "index.m3u8"
+
+    @property
+    def tracking_stride(self) -> int | None:
+        if self.expected_fps and self.tracking_send_fps and self.tracking_send_fps > 0:
+            stride = self.expected_fps / self.tracking_send_fps
+            if abs(round(stride) - stride) > 1e-6:
+                # 정수 stride 가 아니면 None (설정 에러)
+                return None
+            return int(round(stride))
+        return None
+
+
+@dataclass
+class CameraRuntimeState:
+    status: str = CameraStatus.STARTING
+    reason: str | None = None
+    width: int | None = None
+    height: int | None = None
+
+
+CAMERA_CONFIGS: dict[str, CameraConfig] = {}
+CAMERA_STATES: dict[str, CameraRuntimeState] = {}
+
+LATEST_FRAMES: dict[str, np.ndarray] = {}
+LATEST_FRAMES_LOCK = threading.Lock()
+
+
+def load_camera_configs() -> list[CameraConfig]:
+    """
+    CAMERA_CONFIG_PATH 에서 cameras.json 을 읽어서 CameraConfig 리스트로 변환.
+    """
+    cfg_path = Path(CAMERA_CONFIG_PATH)
+    if not cfg_path.exists():
+        raise RuntimeError(f"cameras.json not found: {cfg_path}")
+
+    with cfg_path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, dict) or "cameras" not in raw:
+        raise RuntimeError("cameras.json format error: root must be an object with 'cameras'.")
+
+    cams: list[CameraConfig] = []
+    for item in raw.get("cameras", []):
+        cam_id = str(item.get("id", "")).strip()
+        if not cam_id:
+            continue
+
+        enabled = bool(item.get("enabled", True))
+        if not enabled:
+            state = CameraRuntimeState(status=CameraStatus.OFFLINE, reason="disabled in config")
+            CAMERA_STATES[cam_id] = state
+            continue
+
+        src_type = str(item.get("type", "rtsp")).strip()
+        source = item.get("source")
+        if source is None:
+            raise RuntimeError(f"camera '{cam_id}' has no 'source' field")
+
+        display_name = str(item.get("display_name") or cam_id)
+        expected_fps = item.get("expected_fps")
+        tracking_send_fps = item.get("tracking_send_fps", TRACKING_SEND_FPS_DEFAULT)
+        downscale = str(item.get("downscale") or TRACKING_DOWNSCALE_MODE).strip()
+        file_mode = item.get("file_mode")
+
+        source_str: str
+        if src_type == CameraSourceType.FILE:
+            source_str = _expand_source_path(str(source))
+        elif src_type == CameraSourceType.WEBCAM:
+            # OpenCV 는 정수 인덱스를 기대하지만, 문자열 인자도 받을 수 있으므로 그대로 전달
+            source_str = str(source)
+        else:
+            # 기본은 rtsp/http 등의 스트림
+            source_str = str(source)
+
+        cfg = CameraConfig(
+            camera_id=cam_id,
+            display_name=display_name,
+            type=src_type,
+            source=source_str,
+            expected_fps=float(expected_fps) if expected_fps is not None else None,
+            tracking_send_fps=float(tracking_send_fps) if tracking_send_fps is not None else None,
+            downscale=downscale,
+            enabled=True,
+            file_mode=file_mode,
+        )
+
+        stride = cfg.tracking_stride
+        if cfg.expected_fps and cfg.tracking_send_fps and stride is None:
+            raise RuntimeError(
+                f"camera '{cam_id}': expected_fps={cfg.expected_fps}, "
+                f"tracking_send_fps={cfg.tracking_send_fps} => non-integer stride"
+            )
+
+        cams.append(cfg)
+        CAMERA_STATES.setdefault(cam_id, CameraRuntimeState())
+
+    return cams
+
+
+def register_kakao_if_available() -> None:
+    token = os.getenv("KAKAO_ACCESS_TOKEN")
+    if not token:
+        return
+
+    url = f"{INFERENCE_SERVER_URL}/agent/register_kakao"
+    payload: dict[str, Any] = {
+        "agent_code": AGENT_CODE,
+        "kakao_access_token": token,
+        "note": f"registered by agent '{AGENT_CODE}'",
+    }
     try:
-        subprocess.run(
-            [exe, "-version"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SEC)
+        resp.raise_for_status()
+        print(f"[AGENT] Kakao token registered for agent_code={AGENT_CODE}")
     except Exception as e:
-        raise RuntimeError(
-            f"[Agent] ffmpeg 호출에 실패했습니다: {e}\n"
-            "ffmpeg 설치 및 PATH 설정을 확인해 주세요."
-        )
+        print(f"[AGENT] Kakao token register failed: {e}")
+
+
+def _set_camera_state(cam_id: str, **updates: Any) -> None:
+    state = CAMERA_STATES.setdefault(cam_id, CameraRuntimeState())
+    for k, v in updates.items():
+        setattr(state, k, v)
+
+
+def _update_latest_frame(cam_id: str, frame: np.ndarray) -> None:
+    with LATEST_FRAMES_LOCK:
+        LATEST_FRAMES[cam_id] = frame.copy()
 
 
 # =========================================================
-# HLS 스트리머
+# HLS 스트리머 (기존 구조 유지, 기본은 비활성)
 # =========================================================
+
 
 @dataclass
 class HlsStreamer:
@@ -197,6 +345,9 @@ class HlsStreamer:
     ffmpeg_proc: subprocess.Popen | None = None
 
     def start(self) -> None:
+        if not HLS_ENABLED:
+            return
+
         HLS_ROOT.mkdir(parents=True, exist_ok=True)
         self.camera.hls_dir.mkdir(parents=True, exist_ok=True)
 
@@ -208,36 +359,37 @@ class HlsStreamer:
         input_arg = self.camera.source
 
         # 공통 옵션
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-loglevel", "warning",
-        ]
+        cmd = ["ffmpeg", "-y"]
 
         # 라이브/파일에 따른 입력 옵션
         if looks_live_src(input_arg):
-            # RTSP/HTTP 등 스트림 입력일 경우
             cmd += ["-rtsp_transport", "tcp"]
         else:
-            # 파일 입력일 경우 실시간처럼 흘려보내기
             cmd.append("-re")
 
         # 공통 HLS 출력 옵션
         cmd += [
-            "-i", input_arg,
-            "-c:v", "copy",
+            "-i",
+            input_arg,
+            "-c:v",
+            "copy",
             "-an",
-            "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "5",
-            "-hls_flags", "delete_segments+omit_endlist",
+            "-f",
+            "hls",
+            "-hls_time",
+            "1",
+            "-hls_list_size",
+            "5",
+            "-hls_flags",
+            "delete_segments+program_date_time",
             str(self.camera.hls_playlist),
         ]
 
-        print(f"[HLS:{self.camera.camera_id}] starting ffmpeg: {' '.join(cmd)}")
+        print(f"[HLS:{self.camera.camera_id}] ffmpeg 시작: {' '.join(cmd)}")
         self.ffmpeg_proc = subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
 
@@ -255,8 +407,9 @@ class HlsStreamer:
 
 
 # =========================================================
-# PoseAgentWorker: 한 카메라에 대한 캡처 + Mediapipe + 서버 POST
+# Pose + 서버 연동 워커
 # =========================================================
+
 
 class PoseAgentWorker(threading.Thread):
     def __init__(
@@ -274,16 +427,28 @@ class PoseAgentWorker(threading.Thread):
         self._buf: deque[np.ndarray] = deque(maxlen=self.config.window_size)
         self._ts_buf: deque[float] = deque(maxlen=self.config.window_size)
 
-        self._http_timeout = 5.0
+        self._http_timeout = REQUEST_TIMEOUT_SEC
 
     def stop(self) -> None:
         self._stop_flag.set()
 
     def run(self) -> None:
         cfg = self.config
-        cap = cv2.VideoCapture(cfg.source)
+
+        # OpenCV VideoCapture 소스 선택
+        if cfg.type == CameraSourceType.WEBCAM:
+            # 웹캠 인덱스는 정수일 가능성이 높으므로 캐스팅 시도
+            try:
+                src: Any = int(cfg.source)
+            except ValueError:
+                src = cfg.source
+        else:
+            src = cfg.source
+
+        cap = cv2.VideoCapture(src)
         if not cap.isOpened():
             print(f"[{cfg.camera_id}] failed to open source: {cfg.source}")
+            _set_camera_state(cfg.camera_id, status=CameraStatus.ERROR, reason="failed to open source")
             return
 
         is_live = cfg.is_live
@@ -303,11 +468,12 @@ class PoseAgentWorker(threading.Thread):
 
         fps = cap.get(cv2.CAP_PROP_FPS)
         if fps <= 1e-3:
-            fps = 3.0  # fallback
-        print(
-            f"[{cfg.camera_id}] start: src='{cfg.source}', "
-            f"is_live={is_live}, fps≈{fps:.2f}"
-        )
+            fps = cfg.expected_fps or 3.0
+        if fps <= 1e-3:
+            fps = 3.0
+
+        print(f"[{cfg.camera_id}] start: src='{cfg.source}', is_live={is_live}, fps≈{fps:.2f}")
+        _set_camera_state(cfg.camera_id, status=CameraStatus.STARTING, reason=None)
 
         while not self._stop_flag.is_set():
             loop_start = mono()
@@ -319,15 +485,26 @@ class PoseAgentWorker(threading.Thread):
                     time.sleep(0.1)
                     continue
                 else:
-                    print(f"[{cfg.camera_id}] EOF")
-                    break
+                    # 파일 소스인 경우 종료 또는 loop 모드 처리
+                    if cfg.type == CameraSourceType.FILE and cfg.file_mode == "loop":
+                        cap.release()
+                        cap = cv2.VideoCapture(cfg.source)
+                        continue
+                    else:
+                        print(f"[{cfg.camera_id}] end of file / no more frames")
+                        _set_camera_state(cfg.camera_id, status=CameraStatus.OFFLINE, reason="eof")
+                        break
+
+            h, w, _ = bgr.shape
+            _set_camera_state(cfg.camera_id, status=CameraStatus.ONLINE, width=w, height=h)
+            _update_latest_frame(cfg.camera_id, bgr)
 
             frame_idx += 1
 
             if cfg.frame_skip > 1 and (frame_idx % cfg.frame_skip) != 0:
                 continue
 
-            h, w, _ = bgr.shape
+            # Pose 입력 해상도 리사이즈
             scale = cfg.resize_width / float(w)
             new_w = int(w * scale)
             new_h = int(h * scale)
@@ -368,23 +545,23 @@ class PoseAgentWorker(threading.Thread):
             )
 
             # 슬라이딩 윈도우 stride 만큼 앞으로 밀기
-            for _ in range(cfg.stride):
+            for _ in range(cfg.window_stride):
                 if self._buf:
                     self._buf.popleft()
                 if self._ts_buf:
                     self._ts_buf.popleft()
 
-            # 라이브 소스면 FPS에 맞춰 슬립
+            # 라이브 소스면 FPS에 맞춰 슬립 (대충 맞추는 정도)
             if is_live:
                 loop_end = mono()
                 elapsed = loop_end - loop_start
-                target = 1.0 / fps
-                if elapsed < target:
-                    time.sleep(target - elapsed)
+                target_dt = 1.0 / max(fps, 1e-3)
+                if elapsed < target_dt:
+                    time.sleep(target_dt - elapsed)
 
         cap.release()
         mp_pose.close()
-        print(f"[{cfg.camera_id}] stopped.")
+        print(f"[{cfg.camera_id}] worker stopped")
 
     def _post_window(
         self,
@@ -395,10 +572,10 @@ class PoseAgentWorker(threading.Thread):
     ) -> None:
         url = f"{self.server_url}/behavior/analyze_pose"
 
-        # ⚠ 여기서는 여전히 NaN이 그대로 들어가면 JSON 직렬화 에러가 날 수 있음.
-        #   (필요하면 np.nan_to_num 으로 치환하거나, NaN 포함 윈도우를 스킵하는 로직을
-        #    추가로 넣을 수 있음)
+        # NaN 윈도우 그대로 보내면 JSON 직렬화 에러나 추론 에러가 날 수 있으므로,
+        # 일단은 그대로 두되 서버에서 방어 로직을 두는 방향.
         payload = PoseWindowRequest(
+            agent_code=AGENT_CODE,
             camera_id=self.config.camera_id,
             source_id=self.config.source_id,
             window_index=window_index,
@@ -439,10 +616,24 @@ class PoseAgentWorker(threading.Thread):
 
 
 # =========================================================
-# FastAPI 앱
+# FastAPI 앱 + MJPEG / HLS 서빙
 # =========================================================
 
-app = FastAPI(title="Pose Agent")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    start_from_env()
+    yield
+    # shutdown
+    stop_all()
+
+
+app = FastAPI(
+    title="Pose Agent",
+    lifespan=lifespan,
+)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -451,7 +642,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/hls", StaticFiles(directory=HLS_ROOT), name="hls")
+# HLS는 StaticFiles 로 그대로 노출 (옵션)
+if HLS_ENABLED:
+    app.mount("/hls", StaticFiles(directory=HLS_ROOT), name="hls")
 
 _workers: list[PoseAgentWorker] = []
 _hls_streamers: list[HlsStreamer] = []
@@ -462,15 +655,112 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def start_from_env() -> None:
-    ensure_ffmpeg_available()
-    configs = parse_camera_env()
+@app.get("/cameras", response_model=list[CameraSummary])
+def list_cameras() -> list[CameraSummary]:
+    items: list[CameraSummary] = []
+    for cam_id, cfg in CAMERA_CONFIGS.items():
+        state = CAMERA_STATES.get(cam_id, CameraRuntimeState())
+        mjpeg_url = None
+        if MJPEG_ENABLED:
+            mjpeg_url = f"/streams/{cam_id}.mjpeg"
 
-    print("[AGENT] starting workers and HLS streamers for cameras:")
-    for cfg in configs:
+        hls_url = None
+        if HLS_ENABLED:
+            # 프록시/리버스 프록시를 고려해 HLS_BASE_PATH 기준으로 URL 구성
+            hls_url = f"{HLS_BASE_PATH.rstrip('/')}/{cam_id}/index.m3u8"
+
+        items.append(
+            CameraSummary(
+                id=cam_id,
+                display_name=cfg.display_name,
+                type=cfg.type,
+                status=state.status,
+                reason=state.reason,
+                mjpeg_url=mjpeg_url,
+                hls_url=hls_url,
+                width=state.width,
+                height=state.height,
+                expected_fps=cfg.expected_fps,
+                tracking_send_fps=cfg.tracking_send_fps,
+                downscale=cfg.downscale,
+            )
+        )
+    return items
+
+
+_MJPEG_BOUNDARY = "frame"
+
+
+def _mjpeg_generator(camera_id: str):
+    """
+    최신 프레임을 계속 JPEG로 인코딩해서 multipart/x-mixed-replace 스트림으로 보낸다.
+    """
+    if not MJPEG_ENABLED:
+        return
+
+    while True:
+        with LATEST_FRAMES_LOCK:
+            frame = LATEST_FRAMES.get(camera_id)
+
+        if frame is None:
+            time.sleep(0.1)
+            continue
+
+        ok, jpeg = cv2.imencode(".jpg", frame)
+        if not ok:
+            time.sleep(0.1)
+            continue
+
+        data = jpeg.tobytes()
+        yield (
+            b"--"
+            + _MJPEG_BOUNDARY.encode("ascii")
+            + b"\r\n"
+            + b"Content-Type: image/jpeg\r\n"
+            + b"Content-Length: "
+            + str(len(data)).encode("ascii")
+            + b"\r\n\r\n"
+            + data
+            + b"\r\n"
+        )
+
+        # 너무 과도하게 돌지 않도록 약간 슬립
+        time.sleep(0.04)
+
+
+@app.get("/streams/{camera_id}.mjpeg")
+def mjpeg_stream(camera_id: str):
+    if not MJPEG_ENABLED:
+        raise HTTPException(status_code=404, detail="MJPEG disabled")
+
+    if camera_id not in CAMERA_CONFIGS:
+        raise HTTPException(status_code=404, detail=f"unknown camera_id: {camera_id}")
+
+    return StreamingResponse(
+        _mjpeg_generator(camera_id),
+        media_type=f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY}",
+    )
+
+
+def start_from_env() -> None:
+    print(f"[AGENT] starting with INFERENCE_SERVER_URL={INFERENCE_SERVER_URL}, AGENT_CODE={AGENT_CODE}")
+    ensure_ffmpeg_available()
+
+    cams = load_camera_configs()
+    if not cams:
+        print("[AGENT] no cameras configured")
+        return
+
+    for cfg in cams:
+        CAMERA_CONFIGS[cfg.camera_id] = cfg
+
+    register_kakao_if_available()
+
+    print("[AGENT] starting workers and (optional) HLS streamers for cameras:")
+    for cfg in cams:
         print(f"  - {cfg.camera_id}: src={cfg.source}")
 
-        # HLS 스트리머
+        # HLS 스트리머 (옵션)
         streamer = HlsStreamer(cfg)
         streamer.start()
         _hls_streamers.append(streamer)
@@ -487,14 +777,3 @@ def stop_all() -> None:
     for s in _hls_streamers:
         s.stop()
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup
-    start_from_env()
-    yield
-    # shutdown
-    stop_all()
-
-
-app.router.lifespan_context = lifespan

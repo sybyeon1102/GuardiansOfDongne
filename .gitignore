@@ -28,3 +28,6 @@ node_modules/
 # test
 videos/
 hls/
+
+# config
+cameras.json
