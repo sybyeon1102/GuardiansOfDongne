@@ -34,3 +34,7 @@ cameras.json
 
 # logs
 nohup.out
+
+# build
+build/
+*.egg-info/
