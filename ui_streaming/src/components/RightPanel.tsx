@@ -34,7 +34,7 @@ export function RightPanel({
   selectedHasWarning,
 }: RightPanelProps) {
   return (
-    <div className="bg-white rounded-xl p-4 shadow-sm h-full flex flex-col">
+    <div className="bg-white rounded-xl p-6 shadow-sm h-full flex flex-col">
 
       {/* ------------------ 카메라 정보 ------------------ */}
       <div className="mb-4">
