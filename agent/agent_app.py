@@ -139,7 +139,7 @@ def ensure_ffmpeg_available() -> None:
             "[Agent] ffmpeg 실행 파일을 찾을 수 없습니다.\n"
             "에이전트 환경에 ffmpeg를 설치한 뒤 다시 실행해 주세요.\n"
             "예시)\n"
-            "  - Windows (scoop): scoop install ffmpeg\n"
+            "  - Windows (s.gcdkoop): scoop install ffmpeg\n"
             "  - macOS (brew):   brew install ffmpeg\n"
             "  - Ubuntu:         sudo apt install ffmpeg\n"
         )
@@ -208,10 +208,14 @@ class CameraConfig:
 
     @property
     def tracking_stride(self) -> int | None:
+        """
+        expected_fps / tracking_send_fps 를 정수 stride 로 변환.
+        둘 중 하나라도 없으면 None (트래킹 비활성),
+        정수로 딱 떨어지지 않으면 load 시점에서 에러 처리.
+        """
         if self.expected_fps and self.tracking_send_fps and self.tracking_send_fps > 0:
             stride = self.expected_fps / self.tracking_send_fps
             if abs(round(stride) - stride) > 1e-6:
-                # 정수 stride 가 아니면 None (설정 에러)
                 return None
             return int(round(stride))
         return None
@@ -269,14 +273,11 @@ def load_camera_configs() -> list[CameraConfig]:
         downscale = str(item.get("downscale") or TRACKING_DOWNSCALE_MODE).strip()
         file_mode = item.get("file_mode")
 
-        source_str: str
         if src_type == CameraSourceType.FILE:
             source_str = _expand_source_path(str(source))
         elif src_type == CameraSourceType.WEBCAM:
-            # OpenCV 는 정수 인덱스를 기대하지만, 문자열 인자도 받을 수 있으므로 그대로 전달
             source_str = str(source)
         else:
-            # 기본은 rtsp/http 등의 스트림
             source_str = str(source)
 
         cfg = CameraConfig(
@@ -351,23 +352,19 @@ class HlsStreamer:
         HLS_ROOT.mkdir(parents=True, exist_ok=True)
         self.camera.hls_dir.mkdir(parents=True, exist_ok=True)
 
-        # 기존 세그먼트 정리
         for p in self.camera.hls_dir.glob("*"):
             if p.is_file():
                 p.unlink()
 
         input_arg = self.camera.source
 
-        # 공통 옵션
         cmd = ["ffmpeg", "-y"]
 
-        # 라이브/파일에 따른 입력 옵션
         if looks_live_src(input_arg):
             cmd += ["-rtsp_transport", "tcp"]
         else:
             cmd.append("-re")
 
-        # 공통 HLS 출력 옵션
         cmd += [
             "-i",
             input_arg,
@@ -407,7 +404,7 @@ class HlsStreamer:
 
 
 # =========================================================
-# Pose + 서버 연동 워커
+# Pose + 서버 연동 워커 (+ Tracking 프레임 전송)
 # =========================================================
 
 
@@ -435,9 +432,7 @@ class PoseAgentWorker(threading.Thread):
     def run(self) -> None:
         cfg = self.config
 
-        # OpenCV VideoCapture 소스 선택
         if cfg.type == CameraSourceType.WEBCAM:
-            # 웹캠 인덱스는 정수일 가능성이 높으므로 캐스팅 시도
             try:
                 src: Any = int(cfg.source)
             except ValueError:
@@ -472,7 +467,13 @@ class PoseAgentWorker(threading.Thread):
         if fps <= 1e-3:
             fps = 3.0
 
-        print(f"[{cfg.camera_id}] start: src='{cfg.source}', is_live={is_live}, fps≈{fps:.2f}")
+        tracking_stride = cfg.tracking_stride  # 정수 프레임 간격 또는 None
+
+        print(
+            f"[{cfg.camera_id}] start: src='{cfg.source}', is_live={is_live}, fps≈{fps:.2f}, "
+            f"tracking_send_fps={cfg.tracking_send_fps}, tracking_stride={tracking_stride}, "
+            f"downscale={cfg.downscale}"
+        )
         _set_camera_state(cfg.camera_id, status=CameraStatus.STARTING, reason=None)
 
         while not self._stop_flag.is_set():
@@ -485,7 +486,6 @@ class PoseAgentWorker(threading.Thread):
                     time.sleep(0.1)
                     continue
                 else:
-                    # 파일 소스인 경우 종료 또는 loop 모드 처리
                     if cfg.type == CameraSourceType.FILE and cfg.file_mode == "loop":
                         cap.release()
                         cap = cv2.VideoCapture(cfg.source)
@@ -502,6 +502,7 @@ class PoseAgentWorker(threading.Thread):
             frame_idx += 1
 
             if cfg.frame_skip > 1 and (frame_idx % cfg.frame_skip) != 0:
+                # pose / tracking 둘 다 이 frame_skip 이후 프레임 기준으로 처리
                 continue
 
             # Pose 입력 해상도 리사이즈
@@ -522,36 +523,46 @@ class PoseAgentWorker(threading.Thread):
                     dtype=np.float32,
                 )
             else:
-                # 포즈가 안 잡히는 프레임은 NaN으로 채움
                 kpt = np.full((33, 4), np.nan, np.float32)
 
             self._buf.append(kpt)
             self._ts_buf.append(now)
 
-            if len(self._buf) < cfg.window_size:
-                # 윈도우가 다 안 찼으면 대기
-                continue
+            # 1) Pose 윈도우 -> /behavior/analyze_pose
+            if len(self._buf) >= cfg.window_size:
+                window_kpt = np.stack(list(self._buf), axis=0)  # (T, 33, 4)
+                start_ts = self._ts_buf[0]
+                end_ts = self._ts_buf[-1]
 
-            window_kpt = np.stack(list(self._buf), axis=0)  # (T, 33, 4)
-            start_ts = self._ts_buf[0]
-            end_ts = self._ts_buf[-1]
+                win_idx += 1
+                self._post_window(
+                    window_index=win_idx,
+                    window_kpt=window_kpt,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                )
 
-            win_idx += 1
-            self._post_window(
-                window_index=win_idx,
-                window_kpt=window_kpt,
-                start_ts=start_ts,
-                end_ts=end_ts,
-            )
+                # 슬라이딩 윈도우 stride 만큼 앞으로 밀기
+                for _ in range(cfg.window_stride):
+                    if self._buf:
+                        self._buf.popleft()
+                    if self._ts_buf:
+                        self._ts_buf.popleft()
 
-            # 슬라이딩 윈도우 stride 만큼 앞으로 밀기
-            for _ in range(cfg.window_stride):
-                if self._buf:
-                    self._buf.popleft()
-                if self._ts_buf:
-                    self._ts_buf.popleft()
+            # 2) Tracking 프레임 -> /tracking (다운 샘플링 + 프레임 다운샘플링)
+            if tracking_stride and tracking_stride > 0 and cfg.tracking_send_fps and cfg.tracking_send_fps > 0:
+                if frame_idx % tracking_stride == 0:
+                    track_frame = bgr
+                    if cfg.downscale == "half":
+                        # 가로/세로를 정확히 1/2로 줄여서 (픽셀 단위 정수 연산)
+                        track_frame = cv2.resize(
+                            bgr,
+                            (w // 2, h // 2),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    self._post_tracking_frame(track_frame, frame_idx)
 
-            # 라이브 소스면 FPS에 맞춰 슬립 (대충 맞추는 정도)
+            # 3) 라이브 소스면 FPS에 맞춰 슬립
             if is_live:
                 loop_end = mono()
                 elapsed = loop_end - loop_start
@@ -572,8 +583,6 @@ class PoseAgentWorker(threading.Thread):
     ) -> None:
         url = f"{self.server_url}/behavior/analyze_pose"
 
-        # NaN 윈도우 그대로 보내면 JSON 직렬화 에러나 추론 에러가 날 수 있으므로,
-        # 일단은 그대로 두되 서버에서 방어 로직을 두는 방향.
         payload = PoseWindowRequest(
             agent_code=AGENT_CODE,
             camera_id=self.config.camera_id,
@@ -592,7 +601,6 @@ class PoseAgentWorker(threading.Thread):
             )
             resp.raise_for_status()
         except ValueError as e:
-            # NaN 등으로 인한 JSON 직렬화 에러
             print(f"[{self.config.camera_id}] HTTP error: {e}")
             return
         except requests.RequestException as e:
@@ -614,6 +622,41 @@ class PoseAgentWorker(threading.Thread):
             f"top={inf.top_label}({inf.top_prob:.3f})"
         )
 
+    def _post_tracking_frame(self, frame_bgr: np.ndarray, frame_index: int) -> None:
+        """
+        /tracking 엔드포인트로 다운샘플링된 프레임을 전송한다.
+        - frame_bgr: (H,W,3) BGR 프레임 (이미 downscale 적용된 상태일 수 있음)
+        - frame_index: 원본 캡처 기준 프레임 인덱스
+        """
+        url = f"{self.server_url}/tracking"
+
+        ok, buf = cv2.imencode(".jpg", frame_bgr)
+        if not ok:
+            print(f"[{self.config.camera_id}] tracking: JPEG encode failed")
+            return
+
+        files = {
+            "file": ("frame.jpg", buf.tobytes(), "image/jpeg"),
+        }
+        data = {
+            "agent_code": AGENT_CODE,
+            "camera_id": self.config.camera_id,
+            "timestamp": str(time.time()),
+            "frame_index": str(frame_index),
+        }
+
+        try:
+            resp = self.session.post(
+                url,
+                data=data,
+                files=files,
+                timeout=self._http_timeout,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"[{self.config.camera_id}] tracking HTTP error: {e}")
+            return
+
 
 # =========================================================
 # FastAPI 앱 + MJPEG / HLS 서빙
@@ -622,10 +665,8 @@ class PoseAgentWorker(threading.Thread):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
     start_from_env()
     yield
-    # shutdown
     stop_all()
 
 
@@ -634,7 +675,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -642,7 +682,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HLS는 StaticFiles 로 그대로 노출 (옵션)
 if HLS_ENABLED:
     app.mount("/hls", StaticFiles(directory=HLS_ROOT), name="hls")
 
@@ -666,7 +705,6 @@ def list_cameras() -> list[CameraSummary]:
 
         hls_url = None
         if HLS_ENABLED:
-            # 프록시/리버스 프록시를 고려해 HLS_BASE_PATH 기준으로 URL 구성
             hls_url = f"{HLS_BASE_PATH.rstrip('/')}/{cam_id}/index.m3u8"
 
         items.append(
@@ -692,9 +730,6 @@ _MJPEG_BOUNDARY = "frame"
 
 
 def _mjpeg_generator(camera_id: str):
-    """
-    최신 프레임을 계속 JPEG로 인코딩해서 multipart/x-mixed-replace 스트림으로 보낸다.
-    """
     if not MJPEG_ENABLED:
         return
 
@@ -724,7 +759,6 @@ def _mjpeg_generator(camera_id: str):
             + b"\r\n"
         )
 
-        # 너무 과도하게 돌지 않도록 약간 슬립
         time.sleep(0.04)
 
 
@@ -760,12 +794,10 @@ def start_from_env() -> None:
     for cfg in cams:
         print(f"  - {cfg.camera_id}: src={cfg.source}")
 
-        # HLS 스트리머 (옵션)
         streamer = HlsStreamer(cfg)
         streamer.start()
         _hls_streamers.append(streamer)
 
-        # Pose 워커
         worker = PoseAgentWorker(cfg, server_url=INFERENCE_SERVER_URL)
         worker.start()
         _workers.append(worker)
@@ -776,4 +808,3 @@ def stop_all() -> None:
         w.stop()
     for s in _hls_streamers:
         s.stop()
-

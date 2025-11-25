@@ -1,5 +1,3 @@
-# server/behavior_inference_server.py
-
 import os
 import json
 import time
