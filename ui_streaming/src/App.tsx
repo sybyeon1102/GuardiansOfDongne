@@ -1,9 +1,6 @@
 // src/App.tsx
 // ----------------------------------------------------------------------
-// 새 구조 (2번):
-// - 8001(Agent) 에서 카메라 목록 호출 → 즉시 영상 표시
-// - 8000(Server) 은 behavior 값만 가져옴 (없으면 값 0%)
-// - /behavior/latest_all 값은 카메라 목록과 독립 동작
+// 최종 완성본 (트래킹 + behavior + 메인비디오 + 그리드 + RightPanel 연동)
 // ----------------------------------------------------------------------
 
 import { useEffect, useMemo, useState } from "react";
@@ -13,9 +10,9 @@ import { VideoGrid } from "./components/VideoGrid";
 import { MainVideoPlayer } from "./components/MainVideoPlayer";
 import { RightPanel } from "./components/RightPanel";
 
-// ----------------------------------------------------------------------
-// 타입들
-// ----------------------------------------------------------------------
+// -------------------------------------------------------------
+// 타입 정의
+// -------------------------------------------------------------
 
 type CameraFeed = {
   cameraId: string;
@@ -58,20 +55,50 @@ type BehaviorResult = {
 
 type ConnectionStatus = "ok" | "disconnected";
 
+// -------------------------------------------------------------
+// Tracking 타입
+// -------------------------------------------------------------
+
+export interface TrackingBBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface TrackingObject {
+  global_id: string;
+  local_track_id: number;
+  label: string;
+  confidence: number;
+  bbox: TrackingBBox;
+}
+
+export interface TrackingSnapshot {
+  camera_id: string;
+  timestamp: number;
+  frame_index: number | null;
+  objects: TrackingObject[];
+}
+
+// -------------------------------------------------------------
+
 const WARNING_THRESHOLD = 0.4;
 
-// ----------------------------------------------------------------------
+// -------------------------------------------------------------
 // 환경 변수
-// ----------------------------------------------------------------------
+// -------------------------------------------------------------
 
 const INFERENCE_BASE_URL =
   import.meta.env.VITE_INFERENCE_BASE_URL ?? "http://localhost:8000";
 const AGENT_CODE =
   import.meta.env.VITE_AGENT_CODE ?? "agent-main-building-01";
+const AGENT_BASE_URL =
+  import.meta.env.VITE_AGENT_BASE_URL ?? "http://localhost:8001";
 
-// ----------------------------------------------------------------------
+// -------------------------------------------------------------
 // 메인 App
-// ----------------------------------------------------------------------
+// -------------------------------------------------------------
 
 export default function App() {
   // 카메라 목록
@@ -79,21 +106,26 @@ export default function App() {
   const [mainCameraId, setMainCameraId] = useState<string | null>(null);
   const [draggedCameraId, setDraggedCameraId] = useState<string | null>(null);
 
-  // Behavior 값 저장
+  // Behavior 저장
   const [behaviorByCamera, setBehaviorByCamera] = useState<
     Record<string, BehaviorResult>
+  >({});
+
+  // Tracking 저장
+  const [trackingByCamera, setTrackingByCamera] = useState<
+    Record<string, TrackingSnapshot>
   >({});
 
   const [warningCameraIds, setWarningCameraIds] = useState<string[]>([]);
   const [selectedHasWarning, setSelectedHasWarning] = useState(false);
 
-  // 서버 연결/지연 상태
+  // 연결 상태 관리
+  const [lastPongAt, setLastPongAt] = useState<number | null>(null);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("ok");
   const [isDataStale, setIsDataStale] = useState(true);
-  const [lastPongAt, setLastPongAt] = useState<number | null>(null);
 
-  // RightPanel 값
+  // RightPanel 값들
   const [probabilities, setProbabilities] = useState<Probabilities>({
     fall: 0,
     abandon: 0,
@@ -111,14 +143,14 @@ export default function App() {
   const [eventLogs, setEventLogs] = useState<EventLogEntry[]>([]);
 
   // ----------------------------------------------------------------------
-  // (1) 8001 에이전트에서 카메라 목록 가져오기
+  // (1) Agent(8001) 에서 카메라 목록 가져오기
   // ----------------------------------------------------------------------
 
   useEffect(() => {
     const fetchCameras = async () => {
       try {
-        const res = await fetch("http://localhost:8001/cameras");
-        if (!res.ok) throw new Error("Fail");
+        const res = await fetch(`${AGENT_BASE_URL}/cameras`);
+        if (!res.ok) throw new Error();
 
         const cams = await res.json();
         const feeds: CameraFeed[] = cams.map((cam: any) => ({
@@ -128,61 +160,58 @@ export default function App() {
 
         setVideoFeeds(feeds);
 
-        // 기본 메인 카메라 선택
+        // 초기 메인 카메라 설정
         if (feeds.length > 0 && !mainCameraId) {
           setMainCameraId(feeds[0].cameraId);
         }
-      } catch (err) {
-        console.error("Failed to load cameras:", err);
+      } catch {
+        console.warn("[Agent] failed to load camera list");
       }
     };
 
     fetchCameras();
     const id = setInterval(fetchCameras, 5000);
     return () => clearInterval(id);
-  }, []);
+  }, [mainCameraId]);
 
   // ----------------------------------------------------------------------
-  // (2) 8000 에서 Behavior 값 가져오기
+  // (2) 8000 behavior/latest_all 가져오기
   // ----------------------------------------------------------------------
 
   useEffect(() => {
-    const url = `${INFERENCE_BASE_URL}/behavior/latest_all?agent_code=${encodeURIComponent(
-      AGENT_CODE
-    )}`;
+    const url = `${INFERENCE_BASE_URL}/behavior/latest_all?agent_code=${AGENT_CODE}`;
 
     const fetchBehavior = async () => {
       try {
         const res = await fetch(url, { cache: "no-store" });
-        if (!res.ok) throw new Error("HTTP error");
-
+        if (!res.ok) throw new Error();
         const data: BehaviorResult[] = await res.json();
 
         setLastPongAt(Date.now());
 
         const byCam: Record<string, BehaviorResult> = {};
-        for (const item of data) byCam[item.camera_id] = item;
+        data.forEach((item) => (byCam[item.camera_id] = item));
         setBehaviorByCamera(byCam);
 
-        // 워닝 카메라 계산
-        const wids: string[] = [];
+        // 워닝 카메라
+        const warns: string[] = [];
         for (const br of Object.values(byCam)) {
-          const anyOver = Object.values(br.prob).some(
-            (v) => v >= WARNING_THRESHOLD
-          );
-          if (anyOver) wids.push(br.camera_id);
+          if (Object.values(br.prob).some((v) => v >= WARNING_THRESHOLD)) {
+            warns.push(br.camera_id);
+          }
         }
-        setWarningCameraIds(wids);
+        setWarningCameraIds(warns);
 
-        // 가장 위험한 이벤트 로그
+        // 로그 추가
         let most: BehaviorResult | null = null;
         for (const br of Object.values(byCam)) {
           if (!br.is_anomaly) continue;
           if (!most || br.top_prob > most.top_prob) most = br;
         }
         if (most) {
-          const now = new Date();
-          const ts = now.toLocaleTimeString("ko-KR", { hour12: false });
+          const ts = new Date().toLocaleTimeString("ko-KR", {
+            hour12: false,
+          });
           setEventLogs((prev) => [
             {
               id: prev.length + 1,
@@ -195,8 +224,8 @@ export default function App() {
             ...prev,
           ]);
         }
-      } catch (err) {
-        console.warn("Behavior fetch failed (server might be off)");
+      } catch {
+        console.warn("[Server] behavior fetch failed");
       }
     };
 
@@ -206,14 +235,39 @@ export default function App() {
   }, []);
 
   // ----------------------------------------------------------------------
-  // ping/pong → 연결 상태 표시
+  // (3) Agent(8001) tracking/latest_all 가져오기
+  // ----------------------------------------------------------------------
+
+  useEffect(() => {
+    const fetchTracking = async () => {
+      try {
+        const res = await fetch(`${AGENT_BASE_URL}/tracking/latest_all`);
+        if (!res.ok) return;
+
+        const data: TrackingSnapshot[] = await res.json();
+        const byCam: Record<string, TrackingSnapshot> = {};
+        data.forEach((snap) => (byCam[snap.camera_id] = snap));
+
+        setTrackingByCamera(byCam);
+      } catch {
+        console.warn("[Agent] tracking fetch failed");
+      }
+    };
+
+    fetchTracking();
+    const id = setInterval(fetchTracking, 500);
+    return () => clearInterval(id);
+  }, []);
+
+  // ----------------------------------------------------------------------
+  // ping/pong 상태 업데이트
   // ----------------------------------------------------------------------
 
   useEffect(() => {
     const timer = setInterval(() => {
       if (!lastPongAt) {
-        setIsDataStale(true);
         setConnectionStatus("disconnected");
+        setIsDataStale(true);
         return;
       }
       const diff = Date.now() - lastPongAt;
@@ -224,7 +278,7 @@ export default function App() {
   }, [lastPongAt]);
 
   // ----------------------------------------------------------------------
-  // (3) RightPanel에 선택된 카메라 값 반영
+  // (4) RightPanel = behavior → 메인 카메라 값 반영
   // ----------------------------------------------------------------------
 
   useEffect(() => {
@@ -232,7 +286,6 @@ export default function App() {
 
     const br = behaviorByCamera[mainCameraId];
     if (!br) {
-      // behavior 없음 → 값 0 유지
       setProbabilities({
         fall: 0,
         abandon: 0,
@@ -276,13 +329,13 @@ export default function App() {
   }, [mainCameraId, behaviorByCamera]);
 
   // ----------------------------------------------------------------------
-  // (4) 메인 선택 카메라 찾기
+  // 메인 카메라 & 트래킹 선택
   // ----------------------------------------------------------------------
 
   const mainCamera = useMemo(() => {
     if (!mainCameraId) return null;
     return (
-      videoFeeds.find((c) => c.cameraId === mainCameraId) ??
+      videoFeeds.find((v) => v.cameraId === mainCameraId) ??
       videoFeeds[0] ??
       null
     );
@@ -290,8 +343,13 @@ export default function App() {
 
   const selectedCameraId = mainCamera?.cameraId ?? null;
 
+  const mainTracking =
+    mainCameraId && trackingByCamera[mainCameraId]
+      ? trackingByCamera[mainCameraId]
+      : null;
+
   // ----------------------------------------------------------------------
-  // DnD
+  // 드래그 앤 드롭
   // ----------------------------------------------------------------------
 
   const handleDragStart = (camId: string) => setDraggedCameraId(camId);
@@ -308,7 +366,9 @@ export default function App() {
         const arr = [...prev];
         const a = arr.findIndex((c) => c.cameraId === draggedCameraId);
         const b = arr.findIndex((c) => c.cameraId === targetId);
-        if (a >= 0 && b >= 0) [arr[a], arr[b]] = [arr[b], arr[a]];
+        if (a >= 0 && b >= 0) {
+          [arr[a], arr[b]] = [arr[b], arr[a]];
+        }
         return arr;
       });
     }
@@ -324,7 +384,7 @@ export default function App() {
   };
 
   // ----------------------------------------------------------------------
-  // Render
+  // 렌더링
   // ----------------------------------------------------------------------
 
   return (
@@ -335,47 +395,45 @@ export default function App() {
 
         <main className="flex-1 overflow-auto p-4">
           <div className="flex gap-4 h-full">
-            {/* LEFT */}
-            <div className="flex-[2.5] flex flex-col gap-4">
-              <VideoGrid
-                cameras={videoFeeds}
-                mainCameraId={mainCameraId}
-                warningCameraIds={warningCameraIds}
-                onSelectCamera={setMainCameraId}
-                onDragStart={handleDragStart}
-                onDropOnThumbnail={handleDropOnThumbnail}
-                isDataStale={isDataStale}
-              />
+             {/* LEFT: 남은 공간 전체 사용 */}
+          <div className="flex-1 flex flex-col gap-4 min-w-0">
+            <VideoGrid
+              cameras={videoFeeds}
+              mainCameraId={mainCameraId}
+              warningCameraIds={warningCameraIds}
+              onSelectCamera={setMainCameraId}
+              onDragStart={handleDragStart}
+              onDropOnThumbnail={handleDropOnThumbnail}
+              isDataStale={isDataStale}
+            />
 
-              {mainCamera && (
-                <MainVideoPlayer
-                  cameraId={mainCamera.cameraId}
-                  isWarning={selectedHasWarning}
-                  isMainSelected={true}
-                  onDragStart={handleDragStart}
-                  onDropOnMain={handleDropOnMain}
-                  isDataStale={isDataStale}
-                />
-              )}
-            </div>
-
-            {/* RIGHT */}
-            <div className="flex-[1.2]">
-              <RightPanel
-                selectedCameraName={mainCamera?.name ?? null}
-                selectedCameraId={selectedCameraId}
-                probabilities={probabilities}
-                connectionStatus={connectionStatus}
-                isDataStale={isDataStale}
-                topLabel={topLabel}
-                topProb={topProb}
-                lastCameraId={lastCameraId}
-                lastSourceId={lastSourceId}
-                eventLogs={eventLogs}
-                selectedHasWarning={selectedHasWarning}
+            {mainCamera && (
+              <MainVideoPlayer
+                cameraId={mainCamera.cameraId}
+                mjpegUrl={`${AGENT_BASE_URL}/streams/${mainCamera.cameraId}.mjpeg`}
+                tracking={mainTracking}
               />
-            </div>
+            )}
           </div>
+
+          {/* RIGHT: 고정 크기 패널 */}
+          <div className="w-[30vw] flex-shrink-0">
+            <RightPanel
+              selectedCameraName={mainCamera?.name ?? null}
+              selectedCameraId={selectedCameraId}
+              probabilities={probabilities}
+              connectionStatus={connectionStatus}
+              isDataStale={isDataStale}
+              topLabel={topLabel}
+              topProb={topProb}
+              lastCameraId={lastCameraId}
+              lastSourceId={lastSourceId}
+              eventLogs={eventLogs}
+              selectedHasWarning={selectedHasWarning}
+            />
+          </div>
+
+        </div>
         </main>
       </div>
     </div>

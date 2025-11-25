@@ -1,148 +1,165 @@
 // src/components/MainVideoPlayer.tsx
-// ----------------------------------------------------------
-// [기능 요약]
-// - Tracking ON: /output/{cameraId}.jpg (추론 결과 이미지)
-// - Tracking OFF: Agent(8001)의 MJPEG 스트림 /streams/{cameraId}.mjpeg
-// - MJPEG 자동 재연결 Hook (useMjpegStream)
-// - FPS 실시간 표시 (/meta/{cameraId})
-// - 경고 상태 → 노란 테두리
-// ----------------------------------------------------------
+import { useEffect, useRef } from "react";
 
-import { useEffect, useState } from "react";
-import { useMjpegStream } from "../hooks/useMjpegStream";
+/* =============================================================
+   Tracking 타입 정의
+============================================================= */
+export interface TrackingBBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
-type MainVideoPlayerProps = {
-  cameraId: string | null;
-  isWarning: boolean;
-  isMainSelected: boolean;
-  onDragStart: (cameraId: string) => void;
-  onDropOnMain: () => void;
-  isDataStale: boolean;
-};
+export interface TrackingObject {
+  global_id: string;
+  local_track_id: number;
+  label: string;
+  confidence: number;
+  bbox: TrackingBBox;
+}
 
+export interface TrackingSnapshot {
+  camera_id: string;
+  timestamp: number;
+  frame_index: number | null;
+  objects: TrackingObject[];
+}
+
+/* =============================================================
+   Props
+============================================================= */
+interface MainVideoPlayerProps {
+  cameraId: string;
+  mjpegUrl: string;
+  tracking: TrackingSnapshot | null;
+}
+
+/* =============================================================
+   MainVideoPlayer
+   - 영상 표시 + 바운딩 박스 오버레이
+   - aspect-video 적용
+============================================================= */
 export function MainVideoPlayer({
   cameraId,
-  isWarning,
-  isMainSelected,
-  onDragStart,
-  onDropOnMain,
-  isDataStale,
+  mjpegUrl,
+  tracking,
 }: MainVideoPlayerProps) {
-  const [trackingEnabled, setTrackingEnabled] = useState(false);
-  const [fps, setFps] = useState<number | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // 추론 서버: 8000
-  const trackingImageUrl = cameraId
-    ? `http://localhost:8000/output/${cameraId}.jpg`
-    : null;
+  /* ------------------------------
+     캔버스를 이미지 렌더링 크기에 맞춤
+  ------------------------------ */
+  const resizeCanvas = () => {
+    const img = imgRef.current;
+    const canvas = canvasRef.current;
+    if (!img || !canvas) return;
 
-  // 🔥 변경 완료 — Agent의 MJPEG 스트림은 8001
-  const originalMjpegUrl = cameraId
-    ? `http://localhost:8001/streams/${cameraId}.mjpeg`
-    : null;
+    canvas.width = img.clientWidth;
+    canvas.height = img.clientHeight;
+  };
 
-  const { imgRef, handleError } = useMjpegStream(
-    originalMjpegUrl ?? "",
-    800
-  );
+  useEffect(() => {
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+    return () => window.removeEventListener("resize", resizeCanvas);
+  }, []);
 
-  // // FPS 가져오기 (8001)
-  // useEffect(() => {
-  //   if (!cameraId) return;
+  /* ------------------------------
+     object-fit: contain 보정 계산
+  ------------------------------ */
+  const computeContainOffset = (
+    naturalW: number,
+    naturalH: number,
+    renderW: number,
+    renderH: number
+  ) => {
+    const videoRatio = naturalW / naturalH;
+    const renderRatio = renderW / renderH;
 
-  //   const fetchFPS = async () => {
-  //     try {
-  //       const res = await fetch(`http://localhost:8001/meta/${cameraId}`);
-  //       if (!res.ok) return;
-  //       const data = await res.json();
-  //       if (typeof data.fps === "number") setFps(data.fps);
-  //     } catch {
-  //       // ignore
-  //     }
-  //   };
+    let drawW = renderW;
+    let drawH = renderH;
+    let offsetX = 0;
+    let offsetY = 0;
 
-  //   fetchFPS();
-  //   const id = setInterval(fetchFPS, 1000);
-  //   return () => clearInterval(id);
-  // }, [cameraId]);
+    if (videoRatio > renderRatio) {
+      drawH = renderW / videoRatio;
+      offsetY = (renderH - drawH) / 2;
+    } else {
+      drawW = renderH * videoRatio;
+      offsetX = (renderW - drawW) / 2;
+    }
 
-  const borderClass = isWarning
-    ? "warning-border"
-    : isMainSelected
-    ? "border-indigo-500"
-    : "border-gray-300";
+    return { offsetX, offsetY, drawW, drawH };
+  };
 
+  /* ------------------------------
+     tracking → bbox 그리기
+  ------------------------------ */
+  useEffect(() => {
+    const img = imgRef.current;
+    const canvas = canvasRef.current;
+    if (!img || !canvas) return;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (!tracking || tracking.objects.length === 0) return;
+
+    const vw = img.clientWidth;
+    const vh = img.clientHeight;
+    const naturalW = img.naturalWidth;
+    const naturalH = img.naturalHeight;
+
+    if (!naturalW || !naturalH) return;
+
+    const { offsetX, offsetY, drawW, drawH } = computeContainOffset(
+      naturalW,
+      naturalH,
+      vw,
+      vh
+    );
+
+    tracking.objects.forEach((obj) => {
+      const bx = offsetX + obj.bbox.x * drawW;
+      const by = offsetY + obj.bbox.y * drawH;
+      const bw = obj.bbox.w * drawW;
+      const bh = obj.bbox.h * drawH;
+
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#00FF00";
+      ctx.strokeRect(bx, by, bw, bh);
+
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(bx, by - 18, 150, 18);
+
+      ctx.fillStyle = "#fff";
+      ctx.font = "12px Arial";
+      ctx.fillText(
+        `${obj.label} #${obj.local_track_id} (${obj.confidence.toFixed(2)})`,
+        bx + 4,
+        by - 5
+      );
+    });
+  }, [tracking]);
+
+  /* ------------------------------
+     렌더링
+     → aspect-video 로 공간 확보
+  ------------------------------ */
   return (
-    <section className="bg-white rounded-xl p-4 shadow-sm">
-      <div
-        draggable={!!cameraId}
-        className={`relative rounded-xl overflow-hidden border-4 ${borderClass}`}
-        onDragStart={() => cameraId && onDragStart(cameraId)}
-        onDrop={(e) => {
-          e.preventDefault();
-          onDropOnMain();
-        }}
-        onDragOver={(e) => e.preventDefault()}
-      >
-        {/* CASE 1: cameraId 없음 */}
-        {!cameraId && (
-          <div className="w-full aspect-video bg-black flex items-center justify-center">
-            <span className="text-gray-400 text-sm">No Signal</span>
-          </div>
-        )}
-
-        {/* CASE 2: Tracking ON → 추론 이미지 */}
-        {cameraId && trackingEnabled && trackingImageUrl && (
-          <div className="w-full aspect-video bg-black">
-            <img
-              src={`${trackingImageUrl}?t=${Date.now()}`}
-              className="w-full h-full object-contain"
-            />
-          </div>
-        )}
-
-        {/* CASE 3: Tracking OFF → 원본 MJPEG */}
-        {cameraId && !trackingEnabled && originalMjpegUrl && (
-          <div className="w-full aspect-video bg-black">
-            <img
-              ref={imgRef}
-              onError={handleError}
-              className="w-full h-full object-contain"
-            />
-          </div>
-        )}
-
-        {/* 카메라 라벨 */}
-        {cameraId && (
-          <div className="absolute top-2 left-2 px-2 py-1 text-xs bg-black/70 text-white rounded">
-            {cameraId}
-          </div>
-        )}
-
-        {/* FPS 표시 */}
-        {cameraId && (
-          <div className="absolute top-2 right-2 px-2 py-1 text-xs bg-black/70 text-white font-mono rounded">
-            FPS: {fps ? fps.toFixed(1) : "--.-"}
-          </div>
-        )}
-
-        {/* 데이터 지연 표시 */}
-        {isDataStale && (
-          <div className="absolute bottom-2 left-2 px-2 py-1 text-xs bg-yellow-500 text-black rounded">
-            Data Delay
-          </div>
-        )}
-
-        {/* Tracking 토글 버튼 */}
-        {cameraId && (
-          <button
-            onClick={() => setTrackingEnabled((v) => !v)}
-            className="absolute bottom-2 right-2 px-3 py-1 bg-white/80 border rounded text-xs"
-          >
-            {trackingEnabled ? "Tracking ON" : "Tracking OFF"}
-          </button>
-        )}
-      </div>
-    </section>
+    <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden">
+      <img
+        ref={imgRef}
+        src={mjpegUrl}
+        alt={cameraId}
+        className="object-contain w-full h-full select-none"
+        onLoad={resizeCanvas}
+      />
+      <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" />
+    </div>
   );
 }
