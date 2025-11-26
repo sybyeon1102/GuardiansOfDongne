@@ -7,6 +7,12 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.121.3",
     "mediapipe>=0.10.21",
+    "modeling",
     "opencv-python>=4.11.0.86",
+    "project-core",
     "requests>=2.32.5",
 ]
+
+[tool.uv.sources]
+project-core = { path = "../core/python" }
+modeling = { path = "../modeling" }

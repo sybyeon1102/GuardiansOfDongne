@@ -21,13 +21,22 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from project_core.env import (
+    load_env,
+    env_str,
+    env_int,
+    env_float,
+    env_bool,
+    env_path,
+)
+
 
 # =========================================================
 # .env 로딩 (agent 디렉터리 기준)
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+load_env(BASE_DIR)
 
 
 # =========================================================
@@ -35,35 +44,34 @@ load_dotenv(BASE_DIR / ".env")
 # =========================================================
 
 
-def _env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 INFERENCE_SERVER_URL_DEFAULT = "http://localhost:8000"
-INFERENCE_SERVER_URL = os.getenv("INFERENCE_SERVER_URL", INFERENCE_SERVER_URL_DEFAULT).rstrip("/")
+INFERENCE_SERVER_URL = env_str(
+    "INFERENCE_SERVER_URL",
+    INFERENCE_SERVER_URL_DEFAULT
+).rstrip("/")
 
-AGENT_CODE = os.getenv("AGENT_CODE", "agent-unknown")
+AGENT_CODE = env_str("AGENT_CODE", "agent-unknown")
 
-CAMERA_CONFIG_PATH = os.getenv("CAMERA_CONFIG_PATH", str((BASE_DIR / "config" / "cameras.json").resolve()))
+CAMERA_CONFIG_PATH = env_path("CAMERA_CONFIG_PATH", BASE_DIR)
 
-STREAM_HTTP_HOST = os.getenv("STREAM_HTTP_HOST", "0.0.0.0")
-STREAM_HTTP_PORT = int(os.getenv("STREAM_HTTP_PORT", "8001"))
+STREAM_HTTP_HOST = env_str("STREAM_HTTP_HOST", "0.0.0.0")
+STREAM_HTTP_PORT = env_int("STREAM_HTTP_PORT", "8001")
 
-MJPEG_ENABLED = _env_bool("MJPEG_ENABLED", "true")
-HLS_ENABLED = _env_bool("HLS_ENABLED", "false")
+MJPEG_ENABLED = env_bool("MJPEG_ENABLED", "true")
+HLS_ENABLED = env_bool("HLS_ENABLED", "false")
 
-HLS_ROOT = Path(os.getenv("HLS_OUTPUT_DIR", "./hls")).resolve()
-HLS_BASE_PATH = os.getenv("HLS_BASE_PATH", "/streams")
+HLS_ROOT = env_path("HLS_OUTPUT_DIR", BASE_DIR)
+HLS_BASE_PATH = env_str("HLS_BASE_PATH", "/streams")
 
-POSE_WINDOW_SIZE = int(os.getenv("POSE_WINDOW_SIZE", "30"))
-POSE_WINDOW_STRIDE = int(os.getenv("POSE_WINDOW_STRIDE", "15"))
-POSE_MAX_FPS = float(os.getenv("POSE_MAX_FPS", "30"))
+POSE_WINDOW_SIZE = env_int("POSE_WINDOW_SIZE", "30")
+POSE_WINDOW_STRIDE = env_int("POSE_WINDOW_STRIDE", "15")
+POSE_MAX_FPS = env_float("POSE_MAX_FPS", "30")
 
-TRACKING_SEND_FPS_DEFAULT = float(os.getenv("TRACKING_SEND_FPS_DEFAULT", "10"))
-TRACKING_DOWNSCALE_MODE = os.getenv("TRACKING_DOWNSCALE_MODE", "half")  # none | half
+TRACKING_SEND_FPS_DEFAULT = env_float("TRACKING_SEND_FPS_DEFAULT", "10.0")
+TRACKING_DOWNSCALE_MODE = env_str("TRACKING_DOWNSCALE_MODE", "half")  # none | half
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-REQUEST_TIMEOUT_SEC = float(os.getenv("REQUEST_TIMEOUT_SEC", "5"))
+LOG_LEVEL = env_str("LOG_LEVEL", "INFO")
+REQUEST_TIMEOUT_SEC = env_float("REQUEST_TIMEOUT_SEC", "5")
 
 
 # =========================================================
