@@ -10,7 +10,7 @@ import torch.nn as nn
 from modeling.device import choose_torch_device
 from modeling.pipeline.pose_features import features_from_pose_seq
 from modeling.inference.types import LSTMAnom
-from modeling.pipeline import PoseArray, FeatureArray
+from modeling.pipeline.types import PoseArray, FeatureArray
 
 
 @dataclass

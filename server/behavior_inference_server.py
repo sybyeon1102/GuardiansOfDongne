@@ -23,7 +23,6 @@ from sqlmodel import (
     select,
 )
 from project_core.env import load_env, env_str, env_float, env_int, env_bool, env_path
-from modeling.pipeline.pose_features import features_from_pose_seq
 from modeling.inference.behavior_det import BehaviorDetector, BehaviorDetectorConfig
 from modeling.inference.behavior_cls import BehaviorClassifier, BehaviorClassifierConfig
 from modeling.tracking.engine import MultiCameraTracker, TrackResult
@@ -282,9 +281,8 @@ def run_detection_from_keypoints(kpt_seq: NDArray[np.floating]) -> float:
     """
     kpt_seq: (T,33,4) -> p_anom
     """
-    feat = features_from_pose_seq(kpt_seq)  # (T,169)
     det = get_detector()
-    return det(feat)
+    return float(det(kpt_seq))
 
 
 def run_classification_from_keypoints(
@@ -293,9 +291,8 @@ def run_classification_from_keypoints(
     """
     kpt_seq: (T,33,4) -> (events, probs)
     """
-    feat = features_from_pose_seq(kpt_seq)  # (T,169)
     clsf = get_classifier()
-    prob_map = clsf(feat)  # dict[label->prob]
+    prob_map = clsf(kpt_seq)  # dict[label->prob]
 
     events = list(clsf.events)
     probs = np.array([prob_map[label] for label in events], dtype=np.float32)

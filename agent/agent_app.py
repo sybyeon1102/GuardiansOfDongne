@@ -14,7 +14,6 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import requests
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -63,8 +62,10 @@ HLS_ENABLED = env_bool("HLS_ENABLED", "false")
 HLS_ROOT = env_path("HLS_OUTPUT_DIR", BASE_DIR)
 HLS_BASE_PATH = env_str("HLS_BASE_PATH", "/streams")
 
-POSE_WINDOW_SIZE = env_int("POSE_WINDOW_SIZE", "30")
-POSE_WINDOW_STRIDE = env_int("POSE_WINDOW_STRIDE", "15")
+BEHAVIOR_TRAIN_FPS = env_float("BEHAVIOR_TRAIN_FPS", 10.0)
+POSE_WINDOW_SIZE = env_int("BEHAVIOR_WINDOW_SIZE", 16)
+POSE_WINDOW_STRIDE = env_int("BEHAVIOR_WINDOW_STRIDE", 4)
+
 POSE_MAX_FPS = env_float("POSE_MAX_FPS", "30")
 
 TRACKING_SEND_FPS_DEFAULT = env_float("TRACKING_SEND_FPS_DEFAULT", "10.0")
@@ -228,6 +229,18 @@ class CameraConfig:
             return int(round(stride))
         return None
 
+    def finalize_pose_timing(self, train_fps: float) -> None:
+        """
+        expected_fps / train_fps 를 기준으로 pose frame_skip 을 자동 설정한다.
+
+        - expected_fps 가 지정되어 있고 train_fps > 0 이면:
+          frame_skip = max(1, round(expected_fps / train_fps))
+        - expected_fps 가 없으면: frame_skip 은 기존 값(기본 1)을 유지.
+        """
+        if self.expected_fps and self.expected_fps > 0 and train_fps > 0:
+            ratio = self.expected_fps / train_fps
+            self.frame_skip = max(1, int(round(ratio)))
+
 
 @dataclass
 class CameraRuntimeState:
@@ -298,6 +311,7 @@ def load_camera_configs() -> list[CameraConfig]:
             downscale=downscale,
             enabled=True,
             file_mode=file_mode,
+            frame_skip=round(expected_fps / BEHAVIOR_TRAIN_FPS)
         )
 
         stride = cfg.tracking_stride
