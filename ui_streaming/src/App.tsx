@@ -1,6 +1,6 @@
 // src/App.tsx
 // ----------------------------------------------------------------------
-// 최종 완성본 (트래킹 + behavior + 메인비디오 + 그리드 + RightPanel 연동)
+// 최종 완성본 (추론값 / 트래킹 안정화 + UI 움직임 문제 해결)
 // ----------------------------------------------------------------------
 
 import { useEffect, useMemo, useState } from "react";
@@ -83,7 +83,7 @@ export interface TrackingSnapshot {
 
 // -------------------------------------------------------------
 
-const WARNING_THRESHOLD = 0.4;
+const WARNING_THRESHOLD = 0.6;
 
 // -------------------------------------------------------------
 // 환경 변수
@@ -160,7 +160,6 @@ export default function App() {
 
         setVideoFeeds(feeds);
 
-        // 초기 메인 카메라 설정
         if (feeds.length > 0 && !mainCameraId) {
           setMainCameraId(feeds[0].cameraId);
         }
@@ -175,7 +174,7 @@ export default function App() {
   }, [mainCameraId]);
 
   // ----------------------------------------------------------------------
-  // (2) 8000 behavior/latest_all 가져오기
+  // (2) behavior/latest_by_camera
   // ----------------------------------------------------------------------
 
   useEffect(() => {
@@ -193,7 +192,6 @@ export default function App() {
         data.forEach((item) => (byCam[item.camera_id] = item));
         setBehaviorByCamera(byCam);
 
-        // 워닝 카메라
         const warns: string[] = [];
         for (const br of Object.values(byCam)) {
           if (Object.values(br.prob).some((v) => v >= WARNING_THRESHOLD)) {
@@ -202,7 +200,6 @@ export default function App() {
         }
         setWarningCameraIds(warns);
 
-        // 로그 추가
         let most: BehaviorResult | null = null;
         for (const br of Object.values(byCam)) {
           if (!br.is_anomaly) continue;
@@ -234,28 +231,34 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
 
+
   // ----------------------------------------------------------------------
-  // (3) Agent(8001) tracking/latest_all 가져오기
+  // (3) tracking/latest_all
   // ----------------------------------------------------------------------
 
   useEffect(() => {
+    const url = `${INFERENCE_BASE_URL}/tracking/latest_all?agent_code=${AGENT_CODE}`;
+
     const fetchTracking = async () => {
       try {
-        const res = await fetch(`${AGENT_BASE_URL}/tracking/latest_all`);
+        const res = await fetch(url, { cache: "no-store" });
         if (!res.ok) return;
 
         const data: TrackingSnapshot[] = await res.json();
         const byCam: Record<string, TrackingSnapshot> = {};
-        data.forEach((snap) => (byCam[snap.camera_id] = snap));
+
+        data.forEach((snap) => {
+          byCam[snap.camera_id] = snap;
+        });
 
         setTrackingByCamera(byCam);
-      } catch {
-        console.warn("[Agent] tracking fetch failed");
+      } catch (err) {
+        console.warn("[Server] tracking fetch error", err);
       }
     };
 
     fetchTracking();
-    const id = setInterval(fetchTracking, 500);
+    const id = setInterval(fetchTracking, 1500);
     return () => clearInterval(id);
   }, []);
 
@@ -285,6 +288,7 @@ export default function App() {
     if (!mainCameraId) return;
 
     const br = behaviorByCamera[mainCameraId];
+
     if (!br) {
       setProbabilities({
         fall: 0,
@@ -388,52 +392,58 @@ export default function App() {
   // ----------------------------------------------------------------------
 
   return (
-    <div className="flex h-screen bg-gray-100">
+    <div className="flex h-screen bg-gray-100 min-h-0">
       <Sidebar />
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col min-h-0">
         <Header />
 
-        <main className="flex-1 overflow-auto p-4">
-          <div className="flex gap-4 h-full">
-             {/* LEFT: 남은 공간 전체 사용 */}
-          <div className="flex-1 flex flex-col gap-4 min-w-0">
-            <VideoGrid
-              cameras={videoFeeds}
-              mainCameraId={mainCameraId}
-              warningCameraIds={warningCameraIds}
-              onSelectCamera={setMainCameraId}
-              onDragStart={handleDragStart}
-              onDropOnThumbnail={handleDropOnThumbnail}
-              isDataStale={isDataStale}
-            />
+        <main className="flex-1 overflow-auto p-4 min-h-0">
+          <div className="flex gap-4 h-full min-h-0">
 
-            {mainCamera && (
-              <MainVideoPlayer
-                cameraId={mainCamera.cameraId}
-                mjpegUrl={`${AGENT_BASE_URL}/streams/${mainCamera.cameraId}.mjpeg`}
-                tracking={mainTracking}
+            {/* LEFT */}
+            <div className="flex-1 flex flex-col gap-4 min-w-0 min-h-0">
+              <VideoGrid
+                cameras={videoFeeds}
+                mainCameraId={mainCameraId}
+                warningCameraIds={warningCameraIds}
+                onSelectCamera={(id) => {
+                  // ← 중복 카메라 선택 방지 (핵심)
+                  if (mainCameraId !== id) {
+                    setMainCameraId(id);
+                  }
+                }}
+                onDragStart={handleDragStart}
+                onDropOnThumbnail={handleDropOnThumbnail}
               />
-            )}
-          </div>
 
-          {/* RIGHT: 고정 크기 패널 */}
-          <div className="w-[30vw] flex-shrink-0">
-            <RightPanel
-              selectedCameraName={mainCamera?.name ?? null}
-              selectedCameraId={selectedCameraId}
-              probabilities={probabilities}
-              connectionStatus={connectionStatus}
-              isDataStale={isDataStale}
-              topLabel={topLabel}
-              topProb={topProb}
-              lastCameraId={lastCameraId}
-              lastSourceId={lastSourceId}
-              eventLogs={eventLogs}
-              selectedHasWarning={selectedHasWarning}
-            />
-          </div>
+              {mainCamera && (
+                <MainVideoPlayer
+                  cameraId={mainCamera.cameraId}
+                  mjpegUrl={`${AGENT_BASE_URL}/streams/${mainCamera.cameraId}.mjpeg`}
+                  tracking={mainTracking}
+                />
+              )}
+            </div>
 
-        </div>
+            {/* RIGHT */}
+            <div className="w-[30vw] flex-shrink-0 min-h-0">
+              <RightPanel
+                selectedCameraName={mainCamera?.name ?? null}
+                selectedCameraId={selectedCameraId}
+                probabilities={probabilities}
+                connectionStatus={connectionStatus} 
+                isDataStale={isDataStale}
+                topLabel={topLabel}
+                topProb={topProb}
+                lastCameraId={lastCameraId}
+                lastSourceId={lastSourceId}
+                eventLogs={eventLogs}
+                selectedHasWarning={selectedHasWarning}
+                isAnomaly={behaviorByCamera[mainCameraId ?? ""]?.is_anomaly ?? false}
+              />
+            </div>
+
+          </div>
         </main>
       </div>
     </div>

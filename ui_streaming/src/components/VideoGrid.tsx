@@ -1,11 +1,6 @@
 // src/components/VideoGrid.tsx
 // ----------------------------------------------------------
-// 기능 요약
-// ----------------------------------------------------------
-// - 카메라 썸네일 3열 그리드
-// - 개수가 많아지면 세로 스크롤 생성
-// - 썸네일은 MJPEG 실시간 스트림
-// - 드래그 앤 드롭 / 경고 표시 / 메인 표시 유지
+// 완성본 - 렌더링 안정화, 중복 클릭 방지, Date.now() 제거
 // ----------------------------------------------------------
 
 type CameraFeed = {
@@ -47,13 +42,12 @@ export function VideoGrid({
     <section
       className="
         bg-white rounded-xl p-4 shadow-sm
-        max-h-[320px]       /* 세로 높이 제한 */
-        overflow-y-auto     /* 카메라가 많아지면 스크롤 */
+        max-h-[320px]
+        overflow-y-auto
       "
     >
       <h2 className="text-sm font-semibold mb-2">Cameras</h2>
 
-      {/* 3열 고정 grid */}
       <div className="grid grid-cols-3 gap-3">
         {cameras.map((cam) => {
           const isMain = cam.cameraId === mainCameraId;
@@ -77,13 +71,16 @@ export function VideoGrid({
                 onDropOnThumbnail(cam.cameraId);
               }}
               onDragOver={(e) => e.preventDefault()}
-              onClick={() => onSelectCamera(cam.cameraId)}
+              onClick={() => {
+                // ← 중복 클릭으로 mainCameraId 흔들리는 문제 완전 차단
+                if (mainCameraId !== cam.cameraId) {
+                  onSelectCamera(cam.cameraId);
+                }
+              }}
               className={`relative cursor-pointer rounded-lg overflow-hidden border-4 ${borderClass} bg-black aspect-video`}
             >
-              <img
-                src={`${mjpegUrl}?t=${Date.now()}`}
-                className="w-full h-full object-cover"
-              />
+              {/* ← MJPEG는 thumbnail에서 refresh 불필요 → Date.now() 제거 */}
+              <img src={mjpegUrl} className="w-full h-full object-cover" />
 
               {isWarning && (
                 <div className="absolute top-1 left-1 px-1.5 py-0.5 bg-yellow-400 text-[10px] font-semibold rounded">

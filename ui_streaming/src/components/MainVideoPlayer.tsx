@@ -1,5 +1,4 @@
-// src/components/MainVideoPlayer.tsx
-import { useEffect, useRef } from "react";
+import React, { useEffect, useRef } from "react";
 
 /* =============================================================
    Tracking 타입 정의
@@ -26,9 +25,6 @@ export interface TrackingSnapshot {
   objects: TrackingObject[];
 }
 
-/* =============================================================
-   Props
-============================================================= */
 interface MainVideoPlayerProps {
   cameraId: string;
   mjpegUrl: string;
@@ -36,39 +32,26 @@ interface MainVideoPlayerProps {
 }
 
 /* =============================================================
-   MainVideoPlayer
-   - 영상 표시 + 바운딩 박스 오버레이
-   - aspect-video 적용
+   컴포넌트 본체
 ============================================================= */
-export function MainVideoPlayer({
-  cameraId,
-  mjpegUrl,
-  tracking,
-}: MainVideoPlayerProps) {
+function MainVideoPlayerBase({ cameraId, mjpegUrl, tracking }: MainVideoPlayerProps) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  /* ------------------------------
-     캔버스를 이미지 렌더링 크기에 맞춤
-  ------------------------------ */
   const resizeCanvas = () => {
     const img = imgRef.current;
     const canvas = canvasRef.current;
     if (!img || !canvas) return;
-
     canvas.width = img.clientWidth;
     canvas.height = img.clientHeight;
   };
 
   useEffect(() => {
-    window.addEventListener("resize", resizeCanvas);
     resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
     return () => window.removeEventListener("resize", resizeCanvas);
   }, []);
 
-  /* ------------------------------
-     object-fit: contain 보정 계산
-  ------------------------------ */
   const computeContainOffset = (
     naturalW: number,
     naturalH: number,
@@ -94,14 +77,10 @@ export function MainVideoPlayer({
     return { offsetX, offsetY, drawW, drawH };
   };
 
-  /* ------------------------------
-     tracking → bbox 그리기
-  ------------------------------ */
-  useEffect(() => {
+  const drawTracking = () => {
     const img = imgRef.current;
     const canvas = canvasRef.current;
     if (!img || !canvas) return;
-
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
@@ -109,12 +88,13 @@ export function MainVideoPlayer({
 
     if (!tracking || tracking.objects.length === 0) return;
 
-    const vw = img.clientWidth;
-    const vh = img.clientHeight;
     const naturalW = img.naturalWidth;
     const naturalH = img.naturalHeight;
 
     if (!naturalW || !naturalH) return;
+
+    const vw = img.clientWidth;
+    const vh = img.clientHeight;
 
     const { offsetX, offsetY, drawW, drawH } = computeContainOffset(
       naturalW,
@@ -134,7 +114,7 @@ export function MainVideoPlayer({
       ctx.strokeRect(bx, by, bw, bh);
 
       ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.fillRect(bx, by - 18, 150, 18);
+      ctx.fillRect(bx, by - 18, 160, 18);
 
       ctx.fillStyle = "#fff";
       ctx.font = "12px Arial";
@@ -144,12 +124,17 @@ export function MainVideoPlayer({
         by - 5
       );
     });
+  };
+
+  useEffect(() => {
+    drawTracking();                       //drawTracking 트래킹 온/오프 여기서
   }, [tracking]);
 
-  /* ------------------------------
-     렌더링
-     → aspect-video 로 공간 확보
-  ------------------------------ */
+  const handleImgLoad = () => {
+    resizeCanvas();
+    drawTracking();                      //drawTracking 트래킹 온/오프 여기서
+  };
+
   return (
     <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden">
       <img
@@ -157,9 +142,12 @@ export function MainVideoPlayer({
         src={mjpegUrl}
         alt={cameraId}
         className="object-contain w-full h-full select-none"
-        onLoad={resizeCanvas}
+        onLoad={handleImgLoad}
       />
       <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" />
     </div>
   );
 }
+
+/* ⭐⭐⭐ MainVideoPlayer 메모이제이션 적용 ⭐⭐⭐ */
+export const MainVideoPlayer = React.memo(MainVideoPlayerBase);
