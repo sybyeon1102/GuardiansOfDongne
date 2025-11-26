@@ -14,12 +14,20 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import requests
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+
+from project_core.env import (
+    load_env,
+    env_str,
+    env_int,
+    env_float,
+    env_bool,
+    env_path,
+)
 
 
 # =========================================================
@@ -27,7 +35,7 @@ from pydantic import BaseModel
 # =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+load_env(BASE_DIR)
 
 
 # =========================================================
@@ -35,35 +43,36 @@ load_dotenv(BASE_DIR / ".env")
 # =========================================================
 
 
-def _env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
-
-
 INFERENCE_SERVER_URL_DEFAULT = "http://localhost:8000"
-INFERENCE_SERVER_URL = os.getenv("INFERENCE_SERVER_URL", INFERENCE_SERVER_URL_DEFAULT).rstrip("/")
+INFERENCE_SERVER_URL = env_str(
+    "INFERENCE_SERVER_URL",
+    INFERENCE_SERVER_URL_DEFAULT
+).rstrip("/")
 
-AGENT_CODE = os.getenv("AGENT_CODE", "agent-unknown")
+AGENT_CODE = env_str("AGENT_CODE", "agent-unknown")
 
-CAMERA_CONFIG_PATH = os.getenv("CAMERA_CONFIG_PATH", str((BASE_DIR / "config" / "cameras.json").resolve()))
+CAMERA_CONFIG_PATH = env_path("CAMERA_CONFIG_PATH", BASE_DIR)
 
-STREAM_HTTP_HOST = os.getenv("STREAM_HTTP_HOST", "0.0.0.0")
-STREAM_HTTP_PORT = int(os.getenv("STREAM_HTTP_PORT", "8001"))
+STREAM_HTTP_HOST = env_str("STREAM_HTTP_HOST", "0.0.0.0")
+STREAM_HTTP_PORT = env_int("STREAM_HTTP_PORT", "8001")
 
-MJPEG_ENABLED = _env_bool("MJPEG_ENABLED", "true")
-HLS_ENABLED = _env_bool("HLS_ENABLED", "false")
+MJPEG_ENABLED = env_bool("MJPEG_ENABLED", "true")
+HLS_ENABLED = env_bool("HLS_ENABLED", "false")
 
-HLS_ROOT = Path(os.getenv("HLS_OUTPUT_DIR", "./hls")).resolve()
-HLS_BASE_PATH = os.getenv("HLS_BASE_PATH", "/streams")
+HLS_ROOT = env_path("HLS_OUTPUT_DIR", BASE_DIR)
+HLS_BASE_PATH = env_str("HLS_BASE_PATH", "/streams")
 
-POSE_WINDOW_SIZE = int(os.getenv("POSE_WINDOW_SIZE", "30"))
-POSE_WINDOW_STRIDE = int(os.getenv("POSE_WINDOW_STRIDE", "15"))
-POSE_MAX_FPS = float(os.getenv("POSE_MAX_FPS", "30"))
+BEHAVIOR_TRAIN_FPS = env_float("BEHAVIOR_TRAIN_FPS", 10.0)
+POSE_WINDOW_SIZE = env_int("BEHAVIOR_WINDOW_SIZE", 16)
+POSE_WINDOW_STRIDE = env_int("BEHAVIOR_WINDOW_STRIDE", 4)
 
-TRACKING_SEND_FPS_DEFAULT = float(os.getenv("TRACKING_SEND_FPS_DEFAULT", "10"))
-TRACKING_DOWNSCALE_MODE = os.getenv("TRACKING_DOWNSCALE_MODE", "half")  # none | half
+POSE_MAX_FPS = env_float("POSE_MAX_FPS", "30")
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-REQUEST_TIMEOUT_SEC = float(os.getenv("REQUEST_TIMEOUT_SEC", "5"))
+TRACKING_SEND_FPS_DEFAULT = env_float("TRACKING_SEND_FPS_DEFAULT", "10.0")
+TRACKING_DOWNSCALE_MODE = env_str("TRACKING_DOWNSCALE_MODE", "half")  # none | half
+
+LOG_LEVEL = env_str("LOG_LEVEL", "INFO")
+REQUEST_TIMEOUT_SEC = env_float("REQUEST_TIMEOUT_SEC", "5")
 
 
 # =========================================================
@@ -220,6 +229,18 @@ class CameraConfig:
             return int(round(stride))
         return None
 
+    def finalize_pose_timing(self, train_fps: float) -> None:
+        """
+        expected_fps / train_fps 를 기준으로 pose frame_skip 을 자동 설정한다.
+
+        - expected_fps 가 지정되어 있고 train_fps > 0 이면:
+          frame_skip = max(1, round(expected_fps / train_fps))
+        - expected_fps 가 없으면: frame_skip 은 기존 값(기본 1)을 유지.
+        """
+        if self.expected_fps and self.expected_fps > 0 and train_fps > 0:
+            ratio = self.expected_fps / train_fps
+            self.frame_skip = max(1, int(round(ratio)))
+
 
 @dataclass
 class CameraRuntimeState:
@@ -290,6 +311,7 @@ def load_camera_configs() -> list[CameraConfig]:
             downscale=downscale,
             enabled=True,
             file_mode=file_mode,
+            frame_skip=round(expected_fps / BEHAVIOR_TRAIN_FPS)
         )
 
         stride = cfg.tracking_stride
