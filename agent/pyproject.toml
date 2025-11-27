@@ -16,24 +16,31 @@ dependencies = [
 [project.optional-dependencies]
 cpu = [
     "torch>=2.9.1",
+    "torchvision",
 ]
 cu130 = [
     "torch>=2.9.1",
+    "torchvision",
 ]
 cu129 = [
     "torch>=2.9.1",
+    "torchvision",
 ]
 cu128 = [
     "torch>=2.5.1",
+    "torchvision",
 ]
 cu126 = [
     "torch>=2.5.1",
+    "torchvision",
 ]
 cu124 = [
     "torch>=2.5.1",
+    "torchvision",
 ]
 cu121 = [
     "torch>=2.5.1",
+    "torchvision",
 ]
 
 [tool.uv]
@@ -128,6 +135,18 @@ conflicts = [
 project-core = { path = "../core/python" }
 modeling = { path = "../modeling" }
 torch = [
+    # CPU 프로파일: 모든 OS에서 CPU 빌드
+    { index = "pytorch-cpu",   extra = "cpu"   },
+
+    # CUDA 프로파일: 리눅스 / 윈도우에서만 사용
+    { index = "pytorch-cu130", extra = "cu130" },
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu121", extra = "cu121" },
+]
+torchvision = [
     # CPU 프로파일: 모든 OS에서 CPU 빌드
     { index = "pytorch-cpu",   extra = "cpu"   },
 
