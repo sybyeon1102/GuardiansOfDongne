@@ -83,7 +83,7 @@ export interface TrackingSnapshot {
 
 // -------------------------------------------------------------
 
-const WARNING_THRESHOLD = 0.6;
+const WARNING_THRESHOLD = 0.9;
 
 // -------------------------------------------------------------
 // 환경 변수
@@ -141,6 +141,9 @@ export default function App() {
   const [lastCameraId, setLastCameraId] = useState<string | null>(null);
   const [lastSourceId, setLastSourceId] = useState<string | null>(null);
   const [eventLogs, setEventLogs] = useState<EventLogEntry[]>([]);
+
+  // 시계용 상태
+  const [currentTime, setCurrentTime] = useState<string>("");
 
   // ----------------------------------------------------------------------
   // (1) Agent(8001) 에서 카메라 목록 가져오기
@@ -230,7 +233,6 @@ export default function App() {
     const id = setInterval(fetchBehavior, 2000);
     return () => clearInterval(id);
   }, []);
-
 
   // ----------------------------------------------------------------------
   // (3) tracking/latest_all
@@ -333,6 +335,21 @@ export default function App() {
   }, [mainCameraId, behaviorByCamera]);
 
   // ----------------------------------------------------------------------
+  // (X) 현재 시간 갱신 (RightPanel 용)
+// ----------------------------------------------------------------------
+  useEffect(() => {
+    const updateTime = () => {
+      setCurrentTime(
+        new Date().toLocaleTimeString("ko-KR", { hour12: false })
+      );
+    };
+
+    updateTime();
+    const id = setInterval(updateTime, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ----------------------------------------------------------------------
   // 메인 카메라 & 트래킹 선택
   // ----------------------------------------------------------------------
 
@@ -399,7 +416,6 @@ export default function App() {
 
         <main className="flex-1 overflow-auto p-4 min-h-0">
           <div className="flex gap-4 h-full min-h-0">
-
             {/* LEFT */}
             <div className="flex-1 flex flex-col gap-4 min-w-0 min-h-0">
               <VideoGrid
@@ -407,7 +423,6 @@ export default function App() {
                 mainCameraId={mainCameraId}
                 warningCameraIds={warningCameraIds}
                 onSelectCamera={(id) => {
-                  // ← 중복 카메라 선택 방지 (핵심)
                   if (mainCameraId !== id) {
                     setMainCameraId(id);
                   }
@@ -419,6 +434,11 @@ export default function App() {
               {mainCamera && (
                 <MainVideoPlayer
                   cameraId={mainCamera.cameraId}
+                  cameraName={mainCamera.name}
+                  topLabel={topLabel}
+                  isAnomaly={
+                    behaviorByCamera[mainCameraId ?? ""]?.is_anomaly ?? false
+                  }
                   mjpegUrl={`${AGENT_BASE_URL}/streams/${mainCamera.cameraId}.mjpeg`}
                   tracking={mainTracking}
                 />
@@ -431,18 +451,18 @@ export default function App() {
                 selectedCameraName={mainCamera?.name ?? null}
                 selectedCameraId={selectedCameraId}
                 probabilities={probabilities}
-                connectionStatus={connectionStatus} 
+                connectionStatus={connectionStatus}
                 isDataStale={isDataStale}
                 topLabel={topLabel}
                 topProb={topProb}
-                lastCameraId={lastCameraId}
-                lastSourceId={lastSourceId}
                 eventLogs={eventLogs}
                 selectedHasWarning={selectedHasWarning}
-                isAnomaly={behaviorByCamera[mainCameraId ?? ""]?.is_anomaly ?? false}
+                isAnomaly={
+                  behaviorByCamera[mainCameraId ?? ""]?.is_anomaly ?? false
+                }
+                currentTime={currentTime}
               />
             </div>
-
           </div>
         </main>
       </div>
