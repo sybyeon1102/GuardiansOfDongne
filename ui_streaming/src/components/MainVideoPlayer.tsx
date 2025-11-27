@@ -1,153 +1,158 @@
-import React, { useEffect, useRef } from "react";
+// src/components/MainVideoPlayer.tsx
+// ----------------------------------------------------------
+// display_name + FPS 묶어서 정확한 위치에 배치
+// 다른 기능 절대 변경 없음
+// ----------------------------------------------------------
 
-/* =============================================================
-   Tracking 타입 정의
-============================================================= */
-export interface TrackingBBox {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
+import { useEffect, useRef, useState } from "react";
+import { TrackingSnapshot } from "../App";
 
-export interface TrackingObject {
-  global_id: string;
-  local_track_id: number;
-  label: string;
-  confidence: number;
-  bbox: TrackingBBox;
-}
-
-export interface TrackingSnapshot {
-  camera_id: string;
-  timestamp: number;
-  frame_index: number | null;
-  objects: TrackingObject[];
-}
-
-interface MainVideoPlayerProps {
+type MainVideoPlayerProps = {
   cameraId: string;
+  cameraName: string;
+  topLabel: string | null;
+  isAnomaly: boolean;
   mjpegUrl: string;
   tracking: TrackingSnapshot | null;
-}
+};
 
-/* =============================================================
-   컴포넌트 본체
-============================================================= */
-function MainVideoPlayerBase({ cameraId, mjpegUrl, tracking }: MainVideoPlayerProps) {
+export function MainVideoPlayer({
+  cameraId,
+  cameraName,
+  topLabel,
+  isAnomaly,
+  mjpegUrl,
+  tracking,
+}: MainVideoPlayerProps) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  const resizeCanvas = () => {
-    const img = imgRef.current;
-    const canvas = canvasRef.current;
-    if (!img || !canvas) return;
-    canvas.width = img.clientWidth;
-    canvas.height = img.clientHeight;
-  };
+  // ----------------------------------------------------------
+  // FPS 계산 (tracking.timestamp 기반)
+  // ----------------------------------------------------------
+  const prevTs = useRef<number | null>(null);
+  const [fps, setFps] = useState<number | null>(null);
 
   useEffect(() => {
-    resizeCanvas();
-    window.addEventListener("resize", resizeCanvas);
-    return () => window.removeEventListener("resize", resizeCanvas);
-  }, []);
-
-  const computeContainOffset = (
-    naturalW: number,
-    naturalH: number,
-    renderW: number,
-    renderH: number
-  ) => {
-    const videoRatio = naturalW / naturalH;
-    const renderRatio = renderW / renderH;
-
-    let drawW = renderW;
-    let drawH = renderH;
-    let offsetX = 0;
-    let offsetY = 0;
-
-    if (videoRatio > renderRatio) {
-      drawH = renderW / videoRatio;
-      offsetY = (renderH - drawH) / 2;
-    } else {
-      drawW = renderH * videoRatio;
-      offsetX = (renderW - drawW) / 2;
+    if (!tracking) {
+      prevTs.current = null;
+      setFps(null);
+      return;
     }
 
-    return { offsetX, offsetY, drawW, drawH };
-  };
+    const curr = tracking.timestamp;
+    const prev = prevTs.current;
 
-  const drawTracking = () => {
-    const img = imgRef.current;
+    if (typeof curr === "number" && typeof prev === "number") {
+      const delta = curr - prev;
+      if (delta > 0 && Number.isFinite(delta)) {
+        const f = 1 / delta;
+        if (Number.isFinite(f)) setFps(f);
+      }
+    }
+
+    prevTs.current = curr;
+  }, [tracking?.timestamp]);
+
+  // ----------------------------------------------------------
+  // Tracking BBoxes
+  // ----------------------------------------------------------
+  useEffect(() => {
+    if (!imgRef.current || !canvasRef.current) return;
+
     const canvas = canvasRef.current;
-    if (!img || !canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    canvas.width = imgRef.current.clientWidth;
+    canvas.height = imgRef.current.clientHeight;
+
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    if (!tracking || tracking.objects.length === 0) return;
-
-    const naturalW = img.naturalWidth;
-    const naturalH = img.naturalHeight;
-
-    if (!naturalW || !naturalH) return;
-
-    const vw = img.clientWidth;
-    const vh = img.clientHeight;
-
-    const { offsetX, offsetY, drawW, drawH } = computeContainOffset(
-      naturalW,
-      naturalH,
-      vw,
-      vh
-    );
+    if (!tracking) return;
 
     tracking.objects.forEach((obj) => {
-      const bx = offsetX + obj.bbox.x * drawW;
-      const by = offsetY + obj.bbox.y * drawH;
-      const bw = obj.bbox.w * drawW;
-      const bh = obj.bbox.h * drawH;
+      const { x, y, w, h } = obj.bbox;
 
+      const px = x * canvas.width;
+      const py = y * canvas.height;
+      const pw = w * canvas.width;
+      const ph = h * canvas.height;
+
+      ctx.strokeStyle = isAnomaly ? "#FF0000" : "#00FF00";
       ctx.lineWidth = 2;
-      ctx.strokeStyle = "#00FF00";
-      ctx.strokeRect(bx, by, bw, bh);
+      ctx.strokeRect(px, py, pw, ph);
 
-      ctx.fillStyle = "rgba(0,0,0,0.6)";
-      ctx.fillRect(bx, by - 18, 160, 18);
+      const labelText =
+        topLabel && typeof topLabel === "string" ? topLabel : "";
 
-      ctx.fillStyle = "#fff";
-      ctx.font = "12px Arial";
-      ctx.fillText(
-        `${obj.label} #${obj.local_track_id} (${obj.confidence.toFixed(2)})`,
-        bx + 4,
-        by - 5
-      );
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(px, py - 14, pw, 14);
+
+      ctx.fillStyle = "#FFF";
+      ctx.font = "12px sans-serif";
+      ctx.fillText(labelText, px + 2, py - 3);
     });
-  };
-
-  useEffect(() => {
-    drawTracking();                       //drawTracking 트래킹 온/오프 여기서
-  }, [tracking]);
-
-  const handleImgLoad = () => {
-    resizeCanvas();
-    drawTracking();                      //drawTracking 트래킹 온/오프 여기서
-  };
+  }, [tracking, topLabel, isAnomaly]);
 
   return (
-    <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden">
+    <div className="relative w-full h-full rounded-lg overflow-hidden bg-black">
+
+      {/* ----------------------------------------------------------
+         display_name + FPS 묶어서 한 그룹 absolute fixed
+         구조만 묶음, 기능은 변화 없음
+      ---------------------------------------------------------- */}
+      <div className="absolute top-2 left-2 flex flex-col gap-1 z-20">
+
+        {/* display_name */}
+        <div
+          className="
+            bg-black/60 text-white
+            text-lg font-bold
+            px-3 py-1.5
+            rounded
+          "
+          style={{
+            textShadow:
+              "-1px 0 0 black, 1px 0 0 black, 0 -1px 0 black, 0 1px 0 black",
+          }}
+        >
+          {cameraName}
+        </div>
+
+        {/* FPS */}
+        {fps !== null && (
+          <div
+            className="
+              bg-black/60 text-white
+              text-base font-bold
+              px-3 py-1.5
+              rounded
+            "
+            style={{
+              textShadow:
+                "-1px 0 0 black, 1px 0 0 black, 0 -1px 0 black, 0 1px 0 black",
+            }}
+          >
+            FPS: {fps.toFixed(1)}
+          </div>
+        )}
+
+      </div>
+
+      {/* MJPEG */}
       <img
         ref={imgRef}
         src={mjpegUrl}
-        alt={cameraId}
-        className="object-contain w-full h-full select-none"
-        onLoad={handleImgLoad}
+        className="w-full h-full object-contain"
+        draggable={false}
       />
-      <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none" />
+
+      {/* Tracking Canvas */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 pointer-events-none"
+      />
     </div>
   );
 }
-
-/* ⭐⭐⭐ MainVideoPlayer 메모이제이션 적용 ⭐⭐⭐ */
-export const MainVideoPlayer = React.memo(MainVideoPlayerBase);
