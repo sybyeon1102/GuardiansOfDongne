@@ -28,6 +28,8 @@ from project_core.env import (
     env_bool,
     env_path,
 )
+from modeling.schemas import PoseWindowRequest
+from modeling.pipeline.pose_features import features_from_pose_seq
 
 
 # =========================================================
@@ -78,18 +80,6 @@ REQUEST_TIMEOUT_SEC = env_float("REQUEST_TIMEOUT_SEC", "5")
 # =========================================================
 # 서버와 맞춘 요청/응답 스키마 (FastAPI 서버 behavior_inference_server.py 참고)
 # =========================================================
-
-
-class PoseWindowRequest(BaseModel):
-    # 서버 쪽 PoseWindowRequest 와 동일하게 맞춘다.
-    agent_code: str
-    camera_id: str
-    source_id: str | None = None
-    window_index: int
-    window_start_ts: float | None = None
-    window_end_ts: float | None = None
-    # (T,33,4): [[ [x,y,z,vis], ...33 ], ...T ]
-    keypoints: list[list[list[float]]]
 
 
 class InferenceResult(BaseModel):
@@ -550,16 +540,28 @@ class PoseAgentWorker(threading.Thread):
             self._buf.append(kpt)
             self._ts_buf.append(now)
 
+
             # 1) Pose 윈도우 -> /behavior/analyze_pose
             if len(self._buf) >= cfg.window_size:
                 window_kpt = np.stack(list(self._buf), axis=0)  # (T, 33, 4)
                 start_ts = self._ts_buf[0]
                 end_ts = self._ts_buf[-1]
 
+                has_pose = bool(np.isfinite(window_kpt).any())
+
+                # 1) Prep v3 원형과 동일한 feature 추출 (ffill/bfill 포함)
+                feat = features_from_pose_seq(window_kpt)  # (T, 169)
+
+                # 2) 0-프레임-윈도우 판정
+                #    - features_from_pose_seq는 NaN→ffill/bfill→NaN→0까지 처리된 상태라
+                #      전체가 사실상 0이면 "의미 있는 포즈가 없다"고 간주할 수 있다.
+
                 win_idx += 1
                 self._post_window(
                     window_index=win_idx,
                     window_kpt=window_kpt,
+                    window_feat=feat,
+                    has_pose=has_pose,
                     start_ts=start_ts,
                     end_ts=end_ts,
                 )
@@ -596,13 +598,21 @@ class PoseAgentWorker(threading.Thread):
         mp_pose.close()
         print(f"[{cfg.camera_id}] worker stopped")
 
+
     def _post_window(
         self,
         window_index: int,
         window_kpt: np.ndarray,
+        window_feat: np.ndarray,
+        has_pose: bool,
         start_ts: float,
         end_ts: float,
     ) -> None:
+        """
+        Pose 윈도우와 대응되는 feature 윈도우 및 has_pose 플래그를 서버로 전송한다.
+        - window_kpt: (T,33,4)
+        - window_feat: (T,feat_dim)  예: feat_dim=169
+        """
         url = f"{self.server_url}/behavior/analyze_pose"
 
         payload = PoseWindowRequest(
@@ -612,7 +622,9 @@ class PoseAgentWorker(threading.Thread):
             window_index=window_index,
             window_start_ts=start_ts,
             window_end_ts=end_ts,
-            keypoints=window_kpt.tolist(),
+            features=window_feat.tolist(),
+            # 새로 추가: 0-프레임-윈도우 여부
+            has_pose=has_pose,
         )
 
         try:

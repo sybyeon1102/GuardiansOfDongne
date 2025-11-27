@@ -21,6 +21,7 @@ trash/
 
 # vscode
 .vscode
+uv.lock
 
 # node
 node_modules/

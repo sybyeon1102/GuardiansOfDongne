@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator
 from contextlib import asynccontextmanager
+import asyncio
 
 import numpy as np
 from numpy.typing import NDArray
@@ -22,10 +23,12 @@ from sqlmodel import (
     create_engine,
     select,
 )
+
 from project_core.env import load_env, env_str, env_float, env_int, env_bool, env_path
 from modeling.inference.behavior_det import BehaviorDetector, BehaviorDetectorConfig
 from modeling.inference.behavior_cls import BehaviorClassifier, BehaviorClassifierConfig
 from modeling.tracking.engine import MultiCameraTracker, TrackResult
+from modeling.schemas import PoseWindowRequest
 
 
 # ---------------------------------------------------------
@@ -142,20 +145,6 @@ class TrackingSnapshot(SQLModel, table=True):
 # ---------------------------------------------------------
 # Pydantic 모델 (요청/응답)
 # ---------------------------------------------------------
-
-
-class PoseWindowRequest(BaseModel):
-    agent_code: str
-
-    camera_id: str
-    source_id: str | None = None
-
-    window_index: int
-    window_start_ts: float | None = None
-    window_end_ts: float | None = None
-
-    # (T,33,4) [x,y,z,visibility]
-    keypoints: list[list[list[float]]]
 
 
 class BehaviorResultResponse(BaseModel):
@@ -275,28 +264,6 @@ def load_models() -> None:
         _classifier.win,
         _classifier.events,
     )
-
-
-def run_detection_from_keypoints(kpt_seq: NDArray[np.floating]) -> float:
-    """
-    kpt_seq: (T,33,4) -> p_anom
-    """
-    det = get_detector()
-    return float(det(kpt_seq))
-
-
-def run_classification_from_keypoints(
-    kpt_seq: NDArray[np.floating],
-) -> tuple[list[str], NDArray[np.float32]]:
-    """
-    kpt_seq: (T,33,4) -> (events, probs)
-    """
-    clsf = get_classifier()
-    prob_map = clsf(kpt_seq)  # dict[label->prob]
-
-    events = list(clsf.events)
-    probs = np.array([prob_map[label] for label in events], dtype=np.float32)
-    return events, probs
 
 
 # ---------------------------------------------------------
@@ -506,7 +473,7 @@ def kakao_test(
 
 
 @app.post("/behavior/analyze_pose", response_model=BehaviorResultResponse)
-def analyze_pose(
+async def analyze_pose(
     payload: PoseWindowRequest,
     session: Session = Depends(get_session),
 ) -> BehaviorResultResponse:
@@ -514,28 +481,40 @@ def analyze_pose(
     agent = get_or_create_agent_by_code(session, payload.agent_code)
     state = _get_state(agent.id, payload.camera_id)
 
-    # 2) 포즈 텐서 변환
-    kpt_seq = np.asarray(payload.keypoints, dtype=np.float32)
-    if kpt_seq.ndim != 3 or kpt_seq.shape[1:] != (33, 4):
+    # 2) 모델 추론
+    # feature 시퀀스는 에이전트에서 전처리되어 넘어온다고 가정한다.
+    if payload.features is None:
         raise HTTPException(
             status_code=400,
-            detail=f"keypoints shape must be (T,33,4), got {kpt_seq.shape}",
+            detail="features field must be provided (T, feat_dim)",
         )
+    feat_seq = np.asarray(payload.features, dtype=np.float32)
 
-    # 3) 모델 추론
-    p_anom = run_detection_from_keypoints(kpt_seq)
-    events, probs = run_classification_from_keypoints(kpt_seq)
+    # 분류 모델은 has_pose 여부와 관계없이 항상 실행하여 prob를 채운다.
+    clsf = get_classifier()
+    det = get_detector()
+    loop = asyncio.get_running_loop()
+
+    det_task = loop.run_in_executor(
+        None, det.predict_anomaly_proba, feat_seq
+    )
+    cls_task = loop.run_in_executor(
+        None, clsf.predict_proba_vector, feat_seq
+    )
+
+    p_anom, (events, probs) = await asyncio.gather(det_task, cls_task)
 
     # softmax 결과를 dict로
     prob_map = {label: float(p) for label, p in zip(events, probs)}
-    top_label: str | None
-    top_prob: float
+
+    p_anom = det.predict_anomaly_proba(feat_seq)
+
     if prob_map:
         top_label, top_prob = max(prob_map.items(), key=lambda kv: kv[1])
     else:
         top_label, top_prob = None, 0.0
 
-    # 4) EMA 업데이트
+    # 3) EMA 업데이트
     prev_ema = state.ema_prob
     if prev_ema is None:
         ema = p_anom
@@ -544,7 +523,7 @@ def analyze_pose(
     state.ema_prob = ema
     state.last_update_ts = time.time()
 
-    # 5) voting
+    # 4) voting
     vote: bool | None
     if ema >= DET_START_THR:
         vote = True
@@ -554,7 +533,7 @@ def analyze_pose(
         vote = None
     state.votes.append(vote)
 
-    # 6) START / END 판정
+    # 5) START / END 판정
     is_anomaly_window = ema >= DET_START_THR
     now_ts = time.time()
     win_start_ts = payload.window_start_ts if payload.window_start_ts is not None else now_ts
@@ -616,7 +595,7 @@ def analyze_pose(
             state.votes.clear()
             state.last_update_ts = now_ts
 
-    # 7) inference_results 저장
+    # 6) inference_results 저장
     stage1_normal = float(1.0 - p_anom)
     stage1_anomaly = float(p_anom)
 

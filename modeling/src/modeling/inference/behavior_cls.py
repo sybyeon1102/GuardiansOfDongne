@@ -8,9 +8,8 @@ import torch
 import torch.nn.functional as F
 
 from modeling.device import choose_torch_device
-from modeling.pipeline.pose_features import features_from_pose_seq
 from modeling.inference.types import LSTMAnom
-from modeling.pipeline.types import PoseArray, FeatureArray
+from modeling.pipeline.types import FeatureArray
 
 
 @dataclass
@@ -35,12 +34,9 @@ class BehaviorClassifier:
     """
     체크포인트를 사용하는 행동 클래스 분류기 래퍼.
 
-    - 입력: 정규화되지 않은 포즈 시퀀스 (T, 33, 4)
-    - 내부:
-      1) features_from_pose_seq 로 (T, feat_dim) feature 생성
-      2) ckpt.meta["norm_mean"], ["norm_std"] 로 feature 정규화
-      3) LSTMAnom (num_out = 클래스 수) 로 logits 계산
-      4) softmax 로 클래스별 확률 계산
+      0) ckpt.meta["norm_mean"], ["norm_std"] 로 feature 정규화
+      1) LSTMAnom (num_out = 클래스 수) 로 logits 계산
+      2) softmax 로 클래스별 확률 계산
     - 출력:
       - dict[label → prob] 형태의 확률 맵
       - (events, probs) 벡터 형태 등의 편의 메서드 제공
@@ -93,9 +89,20 @@ class BehaviorClassifier:
         self.num_out = num_out
         self.events: list[str] = list(events)
 
-        meta: dict[str, Any] = ckpt["meta"]
-        self.meta = meta
-        self.win = int(meta.get("win", 16))
+        meta = ckpt["meta"]
+        if not isinstance(meta, dict):
+            raise TypeError(
+                f"ckpt['meta'] must be a dict, got {type(meta)!r}"
+            )
+        self.meta: dict[str, Any] = meta
+
+        # win 은 meta 에 반드시 있어야 한다 (하드코딩 금지)
+        win = meta.get("win")
+        if win is None:
+            raise ValueError(
+                f"checkpoint meta is missing required key 'win' in {ckpt_path}"
+            )
+        self.win = int(win)
 
         norm_mean = np.asarray(meta["norm_mean"], dtype=np.float32)
         norm_std = np.asarray(meta["norm_std"], dtype=np.float32)
@@ -112,61 +119,27 @@ class BehaviorClassifier:
 
     # -------- internal helpers ------------------------------------------------
 
-    def _pose_to_array(self, kpt_seq: PoseArray | torch.Tensor) -> PoseArray:
-        """
-        입력 포즈 시퀀스를 (T, 33, 4) float32 numpy 배열로 변환하고 검증한다.
-
-        Convert pose sequence to a float32 numpy array of shape (T, 33, 4).
-        """
-        if isinstance(kpt_seq, torch.Tensor):
-            arr = kpt_seq.detach().cpu().numpy()
-        else:
-            arr = np.asarray(kpt_seq)
-
-        if arr.ndim != 3 or arr.shape[1:] != (33, 4):
-            raise ValueError(
-                f"pose sequence must have shape (T, 33, 4), got {arr.shape}"
-            )
-
-        if arr.shape[0] != self.win:
-            raise ValueError(
-                f"window length mismatch: expected T={self.win}, got T={arr.shape[0]}"
-            )
-
-        return arr.astype(np.float32, copy=False)
-
-    def _feature_from_pose(self, pose: PoseArray) -> FeatureArray:
-        """
-        포즈 시퀀스에서 raw feature 시퀀스를 생성한다.
-
-        Build raw feature sequence (T, feat_dim) from pose sequence.
-        """
-        feat = features_from_pose_seq(pose)
-        x = np.asarray(feat, dtype=np.float32)
-
-        if x.ndim != 2 or x.shape[1] != self.feat_dim:
-            raise ValueError(
-                f"features_from_pose_seq must return shape (T,{self.feat_dim}), got {x.shape}"
-            )
-
-        if x.shape[0] != self.win:
-            raise ValueError(
-                f"window length mismatch after feature extraction: "
-                f"expected T={self.win}, got T={x.shape[0]}"
-            )
-
-        return x
-
-    def _preprocess(self, feat: FeatureArray) -> torch.Tensor:
+    def _preprocess(
+        self,
+        feat: FeatureArray | np.ndarray | torch.Tensor,
+    ) -> torch.Tensor:
         """
         raw feature 시퀀스를 정규화하고 (1, T, feat_dim) 텐서로 변환한다.
 
         Normalize raw features and convert to tensor (1, T, feat_dim).
         """
-        x = np.asarray(feat, dtype=np.float32)
+        if isinstance(feat, torch.Tensor):
+            x = feat.detach().cpu().numpy()
+        else:
+            x = np.asarray(feat, dtype=np.float32)
+
         if x.ndim != 2 or x.shape[1] != self.feat_dim:
             raise ValueError(
                 f"feat must have shape (T,{self.feat_dim}), got {x.shape}"
+            )
+        if x.shape[0] != self.win:
+            raise ValueError(
+                f"window length mismatch: expected T={self.win}, got T={x.shape[0]}"
             )
 
         x = (x - self.norm_mean[None, :]) / (self.norm_std[None, :] + self._eps)
@@ -177,16 +150,14 @@ class BehaviorClassifier:
     @torch.no_grad()
     def predict_proba(
         self,
-        kpt_seq: PoseArray | torch.Tensor,
+        feat_seq: FeatureArray | np.ndarray | torch.Tensor,
     ) -> dict[str, float]:
         """
-        포즈 시퀀스 한 윈도우에 대한 클래스별 확률 맵(label → prob)을 계산한다.
+        feature 시퀀스 한 윈도우에 대한 클래스별 확률 맵(label → prob)을 계산한다.
 
-        Compute per-class probability map (label → prob) for a single pose window.
+        Compute per-class probability map (label → prob) for a single feature window.
         """
-        pose = self._pose_to_array(kpt_seq)
-        feat = self._feature_from_pose(pose)
-        x_t = self._preprocess(feat)
+        x_t = self._preprocess(feat_seq)
 
         logits = self.model(x_t)          # (1, C)
         probs = F.softmax(logits, dim=1)  # (1, C)
@@ -201,16 +172,14 @@ class BehaviorClassifier:
     @torch.no_grad()
     def predict_proba_vector(
         self,
-        kpt_seq: PoseArray | torch.Tensor,
+        feat_seq: FeatureArray | np.ndarray | torch.Tensor,
     ) -> tuple[list[str], NDArray[np.float32]]:
         """
         (labels, probs) 형태로 확률 벡터를 반환한다.
 
         Return (labels, probs_vector) for a single window.
         """
-        pose = self._pose_to_array(kpt_seq)
-        feat = self._feature_from_pose(pose)
-        x_t = self._preprocess(feat)
+        x_t = self._preprocess(feat_seq)
 
         logits = self.model(x_t)          # (1, C)
         probs = F.softmax(logits, dim=1)  # (1, C)
@@ -221,21 +190,24 @@ class BehaviorClassifier:
     @torch.no_grad()
     def predict_top1(
         self,
-        kpt_seq: PoseArray | torch.Tensor,
+        feat_seq: FeatureArray | np.ndarray | torch.Tensor,
     ) -> tuple[str, float]:
         """
         가장 확률이 높은 클래스(label, prob)를 반환한다.
 
         Return the most probable class (label, prob).
         """
-        labels, probs = self.predict_proba_vector(kpt_seq)
+        labels, probs = self.predict_proba_vector(feat_seq)
         idx = int(probs.argmax())
         return labels[idx], float(probs[idx])
 
-    def __call__(self, kpt_seq: PoseArray | torch.Tensor) -> dict[str, float]:
+    def __call__(
+        self,
+        feat_seq: FeatureArray | np.ndarray | torch.Tensor,
+    ) -> dict[str, float]:
         """
         인스턴스를 함수처럼 호출하면 predict_proba 와 동일하게 동작한다.
 
-        Calling the instance behaves like predict_proba(kpt_seq).
+        Calling the instance behaves like predict_proba(feat_seq).
         """
-        return self.predict_proba(kpt_seq)
+        return self.predict_proba(feat_seq)
