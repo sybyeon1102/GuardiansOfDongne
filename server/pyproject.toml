@@ -12,9 +12,166 @@ dependencies = [
     "project-core",
     "requests>=2.32.5",
     "sqlmodel>=0.0.27",
+]
+
+[project.optional-dependencies]
+cpu = [
     "torch>=2.9.1",
+]
+cu130 = [
+    "torch>=2.9.1",
+]
+cu129 = [
+    "torch>=2.9.1",
+]
+cu128 = [
+    "torch>=2.5.1",
+]
+cu126 = [
+    "torch>=2.5.1",
+]
+cu124 = [
+    "torch>=2.5.1",
+]
+cu121 = [
+    "torch>=2.5.1",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu130" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "cu129" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "cu128" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "cu126" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "cu124" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "cu121" },
+    ],
+    [
+        { extra = "cu130" },
+        { extra = "cu129" },
+    ],
+    [
+        { extra = "cu130" },
+        { extra = "cu128" },
+    ],
+    [
+        { extra = "cu130" },
+        { extra = "cu126" },
+    ],
+    [
+        { extra = "cu130" },
+        { extra = "cu124" },
+    ],
+    [
+        { extra = "cu130" },
+        { extra = "cu121" },
+    ],
+    [
+        { extra = "cu129" },
+        { extra = "cu128" },
+    ],
+    [
+        { extra = "cu129" },
+        { extra = "cu126" },
+    ],
+    [
+        { extra = "cu129" },
+        { extra = "cu124" },
+    ],
+    [
+        { extra = "cu129" },
+        { extra = "cu121" },
+    ],
+    [
+        { extra = "cu128" },
+        { extra = "cu126" },
+    ],
+    [
+        { extra = "cu128" },
+        { extra = "cu124" },
+    ],
+    [
+        { extra = "cu128" },
+        { extra = "cu121" },
+    ],
+    [
+        { extra = "cu126" },
+        { extra = "cu124" },
+    ],
+    [
+        { extra = "cu126" },
+        { extra = "cu121" },
+    ],
+    [
+        { extra = "cu124" },
+        { extra = "cu121" },
+    ],
 ]
 
 [tool.uv.sources]
 project-core = { path = "../core/python" }
 modeling = { path = "../modeling" }
+torch = [
+    # CPU 프로파일: 모든 OS에서 CPU 빌드
+    { index = "pytorch-cpu",   extra = "cpu"   },
+
+    # CUDA 프로파일: 리눅스 / 윈도우에서만 사용
+    { index = "pytorch-cu130", extra = "cu130" },
+    { index = "pytorch-cu129", extra = "cu129" },
+    { index = "pytorch-cu128", extra = "cu128" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu124", extra = "cu124" },
+    { index = "pytorch-cu121", extra = "cu121" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

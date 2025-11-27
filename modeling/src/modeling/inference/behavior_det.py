@@ -3,14 +3,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from numpy.typing import NDArray
 import torch
 import torch.nn as nn
 
 from modeling.device import choose_torch_device
-from modeling.pipeline.pose_features import features_from_pose_seq
 from modeling.inference.types import LSTMAnom
-from modeling.pipeline.types import PoseArray, FeatureArray
+from modeling.pipeline.types import FeatureArray
 
 
 @dataclass
@@ -32,21 +30,14 @@ class BehaviorDetector:
     """
     체크포인트를 사용하는 이상 탐지기 래퍼.
 
-    - 입력: 정규화되지 않은 포즈 시퀀스 (T, 33, 4)
-      (예: Mediapipe 등으로 얻은 [x, y, z, visibility] 33개 관절)
-    - 내부:
-      1) features_from_pose_seq 로 (T, feat_dim) feature 생성
-      2) ckpt.meta["norm_mean"], ["norm_std"] 로 feature 정규화
-      3) LSTMAnom 모델로 logits 계산 후 sigmoid → p_anom
+      0) ckpt.meta["norm_mean"], ["norm_std"] 로 feature 정규화
+      1) LSTMAnom 모델로 logits 계산 후 sigmoid → p_anom
     - 출력: 이상 확률 p_anom ∈ [0, 1]
 
     Wrapper around anomaly detector.
 
-    - Input: unnormalized pose sequence (T, 33, 4)
-    - Internal:
-      1) features_from_pose_seq → (T, feat_dim)
-      2) normalize via ckpt.meta["norm_mean"/"norm_std"]
-      3) LSTMAnom → sigmoid → p_anom
+      0) normalize via ckpt.meta["norm_mean"/"norm_std"]
+      1) LSTMAnom → sigmoid → p_anom
     - Output: anomaly probability in [0, 1]
     """
 
@@ -85,8 +76,19 @@ class BehaviorDetector:
         self.feat_dim = feat_dim
 
         meta = ckpt["meta"]
+        if not isinstance(meta, dict):
+            raise TypeError(
+                f"ckpt['meta'] must be a dict, got {type(meta)!r}"
+            )
         self.meta: dict[str, Any] = meta
-        self.win = int(meta.get("win", 16))
+
+        # win은 체크포인트 meta에서 반드시 가져와야 한다.
+        win = meta.get("win")
+        if win is None:
+            raise ValueError(
+                f"checkpoint meta is missing required key 'win' in {ckpt_path}"
+            )
+        self.win = int(win)
 
         norm_mean = np.asarray(meta["norm_mean"], dtype=np.float32)
         norm_std = np.asarray(meta["norm_std"], dtype=np.float32)
@@ -104,61 +106,24 @@ class BehaviorDetector:
 
     # -------- internal helpers ------------------------------------------------
 
-    def _pose_to_array(self, kpt_seq: PoseArray | torch.Tensor) -> PoseArray:
-        """
-        입력 포즈 시퀀스를 (T, 33, 4) float32 numpy 배열로 변환하고 검증한다.
-
-        Convert pose sequence to a float32 numpy array of shape (T, 33, 4).
-        """
-        if isinstance(kpt_seq, torch.Tensor):
-            arr = kpt_seq.detach().cpu().numpy()
-        else:
-            arr = np.asarray(kpt_seq)
-
-        if arr.ndim != 3 or arr.shape[1:] != (33, 4):
-            raise ValueError(
-                f"pose sequence must have shape (T, 33, 4), got {arr.shape}"
-            )
-
-        if arr.shape[0] != self.win:
-            raise ValueError(
-                f"window length mismatch: expected T={self.win}, got T={arr.shape[0]}"
-            )
-
-        return arr.astype(np.float32, copy=False)
-
-    def _feature_from_pose(self, pose: PoseArray) -> FeatureArray:
-        """
-        포즈 시퀀스에서 raw feature 시퀀스를 생성한다.
-
-        Build raw feature sequence (T, feat_dim) from pose sequence.
-        """
-        feat = features_from_pose_seq(pose)
-        x = np.asarray(feat, dtype=np.float32)
-
-        if x.ndim != 2 or x.shape[1] != self.feat_dim:
-            raise ValueError(
-                f"features_from_pose_seq must return shape (T,{self.feat_dim}), got {x.shape}"
-            )
-
-        if x.shape[0] != self.win:
-            raise ValueError(
-                f"window length mismatch after feature extraction: "
-                f"expected T={self.win}, got T={x.shape[0]}"
-            )
-
-        return x
-
-    def _preprocess(self, feat: FeatureArray) -> torch.Tensor:
+    def _preprocess(self, feat: FeatureArray | np.ndarray | torch.Tensor) -> torch.Tensor:
         """
         raw feature 시퀀스를 정규화하고 (1, T, feat_dim) 텐서로 변환한다.
 
         Normalize raw features and convert to tensor (1, T, feat_dim).
         """
-        x = np.asarray(feat, dtype=np.float32)
+        if isinstance(feat, torch.Tensor):
+            x = feat.detach().cpu().numpy()
+        else:
+            x = np.asarray(feat, dtype=np.float32)
+
         if x.ndim != 2 or x.shape[1] != self.feat_dim:
             raise ValueError(
                 f"feat must have shape (T,{self.feat_dim}), got {x.shape}"
+            )
+        if x.shape[0] != self.win:
+            raise ValueError(
+                f"window length mismatch: expected T={self.win}, got T={x.shape[0]}"
             )
 
         x = (x - self.norm_mean[None, :]) / (self.norm_std[None, :] + self._eps)
@@ -167,23 +132,24 @@ class BehaviorDetector:
     # -------- public API ------------------------------------------------------
 
     @torch.no_grad()
-    def predict_proba(self, kpt_seq: PoseArray | torch.Tensor) -> float:
+    def predict_proba(self, feat_seq: FeatureArray | np.ndarray | torch.Tensor) -> float:
         """
-        포즈 시퀀스 한 윈도우에 대한 이상 확률 p_anom ∈ [0,1] 을 계산한다.
+        feature 시퀀스 한 윈도우에 대한 이상 확률 p_anom ∈ [0,1] 을 계산한다.
 
-        Compute anomaly probability p_anom ∈ [0, 1] for a single pose window.
+        Compute anomaly probability p_anom ∈ [0, 1] for a single feature window.
+
+        입력:
+          - feat_seq: (T, feat_dim) feature sequence. (예: T=win, feat_dim=169)
         """
-        pose = self._pose_to_array(kpt_seq)
-        feat = self._feature_from_pose(pose)
-        x_t = self._preprocess(feat)
-        logits = self.model(x_t)       # (1, 1)
+        x_t = self._preprocess(feat_seq)
+        logits = self.model(x_t)  # (1, 1)
         p = torch.sigmoid(logits).item()
         return float(p)
 
     @torch.no_grad()
     def predict_is_anomaly(
         self,
-        kpt_seq: PoseArray | torch.Tensor,
+        feat_seq: FeatureArray | np.ndarray | torch.Tensor,
         threshold: float | None = None,
     ) -> bool:
         """
@@ -192,22 +158,25 @@ class BehaviorDetector:
         Predict whether the window is anomalous using a threshold.
         """
         thr = float(threshold) if threshold is not None else self.threshold
-        p = self.predict_proba(kpt_seq)
+        p = self.predict_proba(feat_seq)
         return p >= thr
 
     @torch.no_grad()
-    def predict_anomaly_proba(self, kpt_seq: PoseArray | torch.Tensor) -> float:
+    def predict_anomaly_proba(
+        self,
+        feat_seq: FeatureArray | np.ndarray | torch.Tensor,
+    ) -> float:
         """
         이상 확률 p_anom ∈ [0,1] 을 계산하는 편의 메서드.
 
         Convenience alias for anomaly probability (server-facing).
         """
-        return self.predict_proba(kpt_seq)
+        return self.predict_proba(feat_seq)
 
-    def __call__(self, kpt_seq: PoseArray | torch.Tensor) -> float:
+    def __call__(self, feat_seq: FeatureArray | np.ndarray | torch.Tensor) -> float:
         """
         인스턴스를 함수처럼 호출하면 predict_proba 와 동일하게 동작한다.
 
-        Calling the instance behaves like predict_proba(kpt_seq).
+        Calling the instance behaves like predict_proba(feat_seq).
         """
-        return self.predict_proba(kpt_seq)
+        return self.predict_proba(feat_seq)
